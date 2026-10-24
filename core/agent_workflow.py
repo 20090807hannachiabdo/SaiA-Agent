@@ -44,6 +44,20 @@ class ai_agent:
         if command:
             started = time.time()
             execution_result = self.execute_command(command)
+            # Self-repair: if the command failed, send the real error back to the model and retry (up to 2 times)
+            for attempt in range(2):
+                if not (execution_result or "").startswith("Error executing command"):
+                    break
+                try:
+                    fixed, sep, fixed_message = self.mml.generate_command(
+                        user_input, file_path, command=command, output=execution_result, fix=True
+                    ).partition("####SAIA_MESSAGE####")
+                except Exception:
+                    break
+                if not fixed.strip():
+                    break
+                command, message = fixed.strip(), fixed_message
+                execution_result = self.execute_command(command)
             # Debug log: the last executed command, how long it took, and its output
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_command.txt"), "w", encoding="utf-8") as log:
                 log.write(f"[model: {generated:.1f}s | PowerShell: {time.time() - started:.1f}s]\n\n{command}\n\n--- output ---\n{execution_result}")
