@@ -104,6 +104,19 @@ PYTHON METHOD (Word, Excel, PowerPoint, and multi-file projects):
 - Write non-ASCII text (Arabic, etc.) directly as normal characters
   in the Python code. Never replace it with "?" or transliteration.
 - Write all rows at once, not cell by cell.
+- Keep the Python code simple and syntactically valid:
+  * Build Windows paths with pathlib.Path or os.path.join, and use raw
+    strings r"..." when a path literal is needed.
+  * NEVER put a backslash or the same kind of quote inside an f-string
+    expression. Compute values in separate variables first, or use
+    .format() or string concatenation.
+  * Close every quote and bracket. No line of the Python code may
+    start with '@ (that ends the PowerShell here-string early).
+  * Prefer several small, simple statements over clever one-liners.
+- You have no internet search tool. Never invent news, prices, quotes,
+  or URLs. If the task needs live data, fetch it only from public
+  sources reachable with Python (APIs or RSS feeds) and state clearly
+  in the output file when data was unavailable.
 
 ARABIC SUPPORT (when the request or the content is Arabic):
 - Excel: ws.sheet_view.rightToLeft = True. Align cells with
@@ -336,10 +349,11 @@ Use these details when preparing the requested PowerShell command.
         file_path=None,
         command=None,
         output=None,
+        fix=False,
     ):
         context = self._get_system_context()
 
-        if command is not None:
+        if command is not None and not fix:
             prompt = f"""
 {REPLY_PROMPT}
 
@@ -370,6 +384,19 @@ Return one valid PowerShell command, followed by:
 and a short user-facing message.
 
 Do not return Markdown code fences.
+"""
+
+        if fix:
+            prompt += f"""
+PREVIOUS COMMAND (FAILED):
+{command}
+
+ERROR OUTPUT:
+{(output or "")[:3000]}
+
+The previous command failed. Find the actual cause in the error output
+and return a corrected, complete command in the same output format.
+Do not repeat the same mistake. Keep the corrected code simple.
 """
 
         contents = [prompt]
@@ -464,18 +491,22 @@ Use PowerShell to inspect or process the file as appropriate.
         file_path=None,
         command=None,
         output=None,
+        fix=False,
     ):
         if not isinstance(user_request, str) or not user_request.strip():
             raise ValueError("user_request must be a non-empty string.")
 
         # Command-output mode: explain the result of a previous execution.
-        is_reply_mode = command is not None
+        # With fix=True the failed command and its error are sent back to
+        # generate a corrected command instead.
+        is_reply_mode = command is not None and not fix
 
         contents = self._build_contents(
             user_request=user_request,
             file_path=file_path,
             command=command,
             output=output,
+            fix=fix,
         )
 
         system_instruction = (
