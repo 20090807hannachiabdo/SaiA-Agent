@@ -28,6 +28,26 @@ URL_SUBSCRIPTION = BASE_URL + "/Subscription"
 URL_LOGIN = BASE_URL + "/login"
 URL_SIGN_IN = BASE_URL + "/create_account"
 
+# Attachable file types (Word / Excel / PowerPoint text is extracted in core/api_saia.py)
+OFFICE_PATTERNS = "*.docx *.xlsx *.xlsm *.pptx"
+IMAGE_PATTERNS = "*.png *.jpg *.jpeg *.webp *.bmp *.gif"
+TEXT_PATTERNS = "*.txt *.py *.html *.md *.csv *.json"
+PDF_PATTERNS = "*.pdf"
+ATTACH_FILETYPES = [
+    (
+        "Supported files",
+        " ".join(
+            [OFFICE_PATTERNS, IMAGE_PATTERNS, TEXT_PATTERNS, PDF_PATTERNS]
+        ),
+    ),
+    ("Word", "*.docx"),
+    ("Excel", "*.xlsx *.xlsm"),
+    ("PowerPoint", "*.pptx"),
+    ("Images", IMAGE_PATTERNS),
+    ("Text / Code", TEXT_PATTERNS),
+    ("PDF", PDF_PATTERNS),
+]
+
 
 def _hex_to_colorref(hex_color):
   """Converts a #RRGGBB color to the COLORREF format used by Windows (0x00BBGGRR)"""
@@ -468,22 +488,29 @@ class FloatingOrb:
 
 class QueryWorker(threading.Thread):
 
-  def __init__(self, model_id=None):
+  def __init__(self, model_id=None, is_subscribed=False):
     super().__init__(daemon=True)
     self._queue = queue.Queue()
     self.results = queue.Queue()
     self.agent = None
     self.model_id = model_id
+    # Paid subscribers get the better image models (free users: gemini-3.5-flash)
+    self.is_subscribed = bool(is_subscribed)
 
   def set_model(self, model_id):
     self.model_id = model_id
+
+  def set_subscription(self, is_subscribed):
+    self.is_subscribed = bool(is_subscribed)
+    if self.agent is not None:
+      self.agent.set_subscription(self.is_subscribed)
 
   def run(self):
     while True:
       query, entry_widget, file_path = self._queue.get()
       try:
         if self.agent is None:
-          self.agent = ai_agent()
+          self.agent = ai_agent(is_subscribed=self.is_subscribed)
         result = self.agent.run_workflow(query, file_path)
       except Exception as e:
         result = t("error_exec", error=e)
@@ -1487,7 +1514,7 @@ class SaiAApp:
   def attach_file(self):
     path = filedialog.askopenfilename(
         parent=self.root,
-        filetypes=[("Supported files", "*.png *.jpg *.jpeg *.bmp *.gif *.txt *.py *.html *.md *.pdf")],
+        filetypes=ATTACH_FILETYPES,
     )
     if path:
       self.attached_file = path
