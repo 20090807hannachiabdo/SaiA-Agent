@@ -17,11 +17,18 @@ class ai_agent:
         # The command is run from a script file (no command-line length limit, Arabic text stays intact)
         script = os.path.join(tempfile.gettempdir(), "saia_command.ps1")
         with open(script, "w", encoding="utf-8-sig") as f:
-            f.write("$ErrorActionPreference = 'Stop'\n" + command + "\nif ($LASTEXITCODE) { exit $LASTEXITCODE }\n")
+            f.write(
+                "try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}\n"
+                "$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+                "$env:PYTHONUTF8 = '1'\n"
+                "$env:PYTHONIOENCODING = 'utf-8'\n"
+                "$ErrorActionPreference = 'Stop'\n"
+                + command + "\nif ($LASTEXITCODE) { exit $LASTEXITCODE }\n"
+            )
         try:
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script],
-                cwd=DOWNLOADS, capture_output=True, text=True,
+                cwd=DOWNLOADS, capture_output=True, encoding="utf-8", errors="replace",
                 stdin=subprocess.DEVNULL, timeout=180,
             )
         except subprocess.TimeoutExpired:
