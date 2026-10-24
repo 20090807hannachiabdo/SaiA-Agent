@@ -1,5 +1,7 @@
 import os
 import subprocess
+import tempfile
+import time
 from core.api_saia import mml
 
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -12,21 +14,35 @@ class ai_agent:
     def respond(self, user_input, file_path=None):
         return self.mml.generate_command(user_input, file_path)
     def execute_command(self, command):
+        # The command is run from a script file (no command-line length limit, Arabic text stays intact)
+        script = os.path.join(tempfile.gettempdir(), "saia_command.ps1")
+        with open(script, "w", encoding="utf-8-sig") as f:
+            f.write("$ErrorActionPreference = 'Stop'\n" + command + "\nif ($LASTEXITCODE) { exit $LASTEXITCODE }\n")
         try:
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script],
                 cwd=DOWNLOADS, capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, timeout=60,
+                stdin=subprocess.DEVNULL, timeout=180,
             )
         except subprocess.TimeoutExpired:
-            return "Error: the command did not finish within 300 seconds."
+            return "Error: the command did not finish within 180 seconds."
         if result.returncode != 0:
             return f"Error executing command: {result.stderr}"
         return result.stdout
     def run_workflow(self, user_input, file_path=None):
-        command = self.respond(user_input, file_path)
+        started = time.time()
+        command, _, message = self.respond(user_input, file_path).partition("####SAIA_MESSAGE####")
+        command = command.strip()
+        generated = time.time() - started
         if command:
+            started = time.time()
             execution_result = self.execute_command(command)
+            # Debug log: the last executed command, how long it took, and its output
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_command.txt"), "w", encoding="utf-8") as log:
+                log.write(f"[model: {generated:.1f}s | PowerShell: {time.time() - started:.1f}s]\n\n{command}\n\n--- output ---\n{execution_result}")
+            if message.strip() and not (execution_result or "").strip():
+                # Silent success: use the message written together with the command (no second model call)
+                return message.strip()
             try:
                 return self.mml.generate_command(user_input, command=command, output=execution_result)
             except Exception:
