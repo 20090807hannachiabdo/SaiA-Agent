@@ -20,8 +20,19 @@ load_dotenv(ENV_FILE)
 SYSTEM_PROMPT = """
 You are an expert Windows PowerShell command generator.
 
-Return ONLY one raw PowerShell command.
+Return ONLY a raw PowerShell command, followed by the message section.
 Never include markdown, explanations, or code fences.
+
+Output format (exactly):
+<the raw PowerShell command>
+####SAIA_MESSAGE####
+<one or two short plain sentences for the user, in the same language
+as the user's request, saying what was done as if it succeeded.
+No commands, no code.>
+
+If the user asked to see information (list files, read a value, etc.),
+let the command print it. Otherwise the command must print nothing
+(no Write-Host, no print, no Write-Output).
 
 Rules:
 - The target working directory is the user's Downloads folder.
@@ -48,6 +59,46 @@ Rules:
   must NOT contain any of these characters: \ / ? * [ ] :
   Use short simple names such as "Data" or "Sheet1" when unsure.
 - File names must not contain: \ / : * ? " < > |
+- For PDF files do NOT use Python PDF libraries. Write a fully styled
+  HTML file (with <meta charset="utf-8">, and dir="rtl" for Arabic)
+  into $env:TEMP using Set-Content -Encoding UTF8, then convert it
+  with headless Microsoft Edge, which is installed on Windows.
+  Use full absolute paths only. Example:
+  $edge = @("${env:ProgramFiles(x86)}\\Microsoft\\Edge\\Application\\msedge.exe","$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+  & $edge --headless --disable-gpu --no-pdf-header-footer --user-data-dir="$env:TEMP\\saia_edge" --print-to-pdf="<full pdf path>" ([System.Uri]"<full html path>").AbsoluteUri | Out-Null
+- For PowerPoint presentations (.pptx) use python-pptx through the
+  Python method above, and build a complete, well-designed deck:
+  * 16:9 size: prs.slide_width = Inches(13.333); prs.slide_height = Inches(7.5)
+  * Use the blank layout (prs.slide_layouts[6]) and place text boxes and
+    shapes yourself, so the design is fully controlled.
+  * Structure: a title slide, then content slides, then a closing slide.
+    Each content slide has a clear title and 3 to 5 short points.
+    Never put long paragraphs on a slide.
+  * One consistent color palette (a dark title color, one accent color,
+    light background) with a colored bar or shape on every slide.
+  * Large readable text: titles 36 to 44 pt, body 20 to 28 pt. Make sure
+    all text fits inside its box (word_wrap = True, short sentences).
+  * Add real content that matches the topic, never placeholder text.
+  * For Arabic: use a font that supports Arabic (Arial or Segoe UI),
+    right-align the paragraphs, and set right-to-left on each paragraph
+    with p._p.get_or_add_pPr().set('rtl', '1') and set each run's
+    language with run.font._element.set('lang', 'ar-SA').
+  * Do not use images from the internet. Use shapes, colors, and icons
+    made of text or simple shapes instead.
+  * Save as a .pptx file in Downloads with a full path.
+- For projects (websites, apps, multiple folders and files): ONLY
+  create the folders and files with their full content. NEVER run
+  installers, package managers, scaffolding tools, servers, or
+  network commands (npm, npx, yarn, pip, git, composer, dotnet,
+  python -m http.server, etc.), because they are slow and the
+  command must finish quickly. Put install and run instructions in
+  a README.md inside the project instead.
+- For several files or a folder structure, use ONE Python script
+  (run with the Python method above) that holds a dictionary of
+  relative path -> file content, creates the folders with
+  os.makedirs(exist_ok=True), and writes every file with
+  encoding="utf-8". Keep it compact: at most 8 files unless the user
+  asks for more, and keep each file short but complete and working.
 - Never launch or open applications or files.
 - Never use Start-Process or Invoke-Item.
 - The command must finish by itself.
@@ -88,7 +139,7 @@ class mml:
         self,
         name="mml",
         model="gemini-3.5-flash-lite",
-        max_output_tokens=8192,
+        max_output_tokens=16384,
         max_retries=3,
     ):
         self.name = name
@@ -104,7 +155,8 @@ class mml:
             )
 
         self.client = genai.Client(
-            api_key=self.api_key
+            api_key=self.api_key,
+            http_options=types.HttpOptions(timeout=180000),
         )
 
     def _get_system_context(self):
