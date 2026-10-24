@@ -7,10 +7,13 @@ from core.api_saia import mml
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
 
 class ai_agent:
-    def __init__(self, name="AI Agent", role="assistant"):
+    def __init__(self, name="AI Agent", role="assistant", is_subscribed=False):
         self.name = name
         self.role = role
-        self.mml = mml()
+        self.mml = mml(is_subscribed=is_subscribed)
+    def set_subscription(self, is_subscribed):
+        # Call this when the user's plan changes (paid = better image models)
+        self.mml.is_subscribed = bool(is_subscribed)
     def respond(self, user_input, file_path=None):
         return self.mml.generate_command(user_input, file_path)
     def execute_command(self, command):
@@ -38,7 +41,16 @@ class ai_agent:
         return result.stdout
     def run_workflow(self, user_input, file_path=None):
         started = time.time()
-        command, _, message = self.respond(user_input, file_path).partition("####SAIA_MESSAGE####")
+        raw = self.respond(user_input, file_path).strip()
+        if raw.startswith("####SAIA_MEDIA####"):
+            # Image / speech / video request: made by the most suitable Gemini media model (no PowerShell)
+            head, _, media_message = raw[len("####SAIA_MEDIA####"):].partition("####SAIA_MESSAGE####")
+            media_kind, _, media_prompt = head.strip().partition("\n")
+            media_path = self.mml.generate_command(
+                user_input, file_path, media=media_kind.strip().lower(), media_prompt=media_prompt.strip()
+            )
+            return f"{media_message.strip()}\n\n{media_path}".strip()
+        command, _, message = raw.partition("####SAIA_MESSAGE####")
         command = command.strip()
         generated = time.time() - started
         if command:
