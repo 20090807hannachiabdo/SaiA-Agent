@@ -4,6 +4,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 import webbrowser
 from tkinter import filedialog
 from core.agent_workflow import ai_agent
@@ -27,26 +28,6 @@ URL_ABOUT = BASE_URL
 URL_SUBSCRIPTION = BASE_URL + "/Subscription"
 URL_LOGIN = BASE_URL + "/login"
 URL_SIGN_IN = BASE_URL + "/create_account"
-
-# Attachable file types (Word / Excel / PowerPoint text is extracted in core/api_saia.py)
-OFFICE_PATTERNS = "*.docx *.xlsx *.xlsm *.pptx"
-IMAGE_PATTERNS = "*.png *.jpg *.jpeg *.webp *.bmp *.gif"
-TEXT_PATTERNS = "*.txt *.py *.html *.md *.csv *.json"
-PDF_PATTERNS = "*.pdf"
-ATTACH_FILETYPES = [
-    (
-        "Supported files",
-        " ".join(
-            [OFFICE_PATTERNS, IMAGE_PATTERNS, TEXT_PATTERNS, PDF_PATTERNS]
-        ),
-    ),
-    ("Word", "*.docx"),
-    ("Excel", "*.xlsx *.xlsm"),
-    ("PowerPoint", "*.pptx"),
-    ("Images", IMAGE_PATTERNS),
-    ("Text / Code", TEXT_PATTERNS),
-    ("PDF", PDF_PATTERNS),
-]
 
 
 def _hex_to_colorref(hex_color):
@@ -488,33 +469,31 @@ class FloatingOrb:
 
 class QueryWorker(threading.Thread):
 
-  def __init__(self, model_id=None, is_subscribed=False):
+  def __init__(self, model_id=None):
     super().__init__(daemon=True)
     self._queue = queue.Queue()
     self.results = queue.Queue()
     self.agent = None
     self.model_id = model_id
-    # Paid subscribers get the better image models (free users: gemini-3.5-flash)
-    self.is_subscribed = bool(is_subscribed)
 
   def set_model(self, model_id):
     self.model_id = model_id
 
-  def set_subscription(self, is_subscribed):
-    self.is_subscribed = bool(is_subscribed)
-    if self.agent is not None:
-      self.agent.set_subscription(self.is_subscribed)
-
   def run(self):
     while True:
       query, entry_widget, file_path = self._queue.get()
+
+      def report(text, _entry=entry_widget):
+        # Live progress from the agent thread; the UI thread reads it in _poll_results
+        self.results.put(("status", text, _entry))
+
       try:
         if self.agent is None:
-          self.agent = ai_agent(is_subscribed=self.is_subscribed)
-        result = self.agent.run_workflow(query, file_path)
+          self.agent = ai_agent()
+        result = self.agent.run_workflow(query, file_path, on_status=report)
       except Exception as e:
         result = t("error_exec", error=e)
-      self.results.put((result, entry_widget))
+      self.results.put(("result", result, entry_widget))
 
   def submit(self, query, entry_widget, file_path=None):
     self._queue.put((query, entry_widget, file_path))
@@ -673,6 +652,16 @@ def recolor_tree(widget, mapping):
         pass
   if isinstance(widget, MinimalScrollbar):
     widget._draw()
+  elif isinstance(widget, tk.Canvas):
+    # Rounded message bubbles are canvas polygons: recolor their fill and outline too
+    for item in widget.find_all():
+      for option in ("fill", "outline"):
+        try:
+          new = mapping.get(str(widget.itemcget(item, option)).lower())
+          if new:
+            widget.itemconfigure(item, **{option: new})
+        except tk.TclError:
+          pass
   for child in widget.winfo_children():
     recolor_tree(child, mapping)
 
@@ -1205,6 +1194,7 @@ class SaiAApp:
     self._settings_win = None
     self.model_pickers = []
     self.attached_file = None
+    self._bubbles = []
 
     self.root = tk.Tk()
     self.root.title("SaiA Agent")
@@ -1222,6 +1212,9 @@ class SaiAApp:
     self._pending = set()
     self._think_tick = 0
     self._think_job = None
+    self._steps = []
+    self._current_status = None
+    self._rows_shown = 0
 
     self.worker = QueryWorker(self.settings.get("selected_model"))
     self.worker.start()
@@ -1358,7 +1351,22 @@ class SaiAApp:
     self.output_box.tag_configure("user_tag", foreground=Theme.TEXT_SECONDARY)
     self.output_box.tag_configure("bot_tag", foreground=Theme.ACCENT_HOVER)
     self.output_box.tag_configure("thinking", foreground=Theme.TEXT_MUTED)
+    # Message bubbles: names above them, user on the right, SaiA on the left
+    self.output_box.tag_configure("name_user", foreground=Theme.TEXT_SECONDARY, font=("Segoe UI", 8, "bold"), spacing1=4, spacing3=3)
+    self.output_box.tag_configure("name_bot", foreground=Theme.ACCENT_HOVER, font=("Segoe UI", 8, "bold"), spacing1=4, spacing3=3)
+    self.output_box.tag_configure("right_align", justify="right", rmargin=8)
+    self.output_box.tag_configure("left_align", justify="left", lmargin1=8, lmargin2=8)
+    self.output_box.tag_configure("gap", spacing3=12)
     self.output_box.pack(side="left", fill="both", expand=True)
+    # Bubbles follow the window width when it is resized
+    self.output_box.bind(
+        "<Configure>",
+        lambda e: [
+            (cv.configure(width=w), cv.itemconfigure(win, width=w - 2 * pad))
+            for cv, win, natural, pad in self._bubbles
+            for w in [max(140, min(e.width - 44, natural))]
+        ],
+    )
 
     # 4. Read-only: the user can select and copy, but cannot type, paste or delete.
     #    The program unlocks it briefly (state="normal") whenever it writes to it.
@@ -1384,7 +1392,10 @@ class SaiAApp:
     entry_wrap.pack(side="left", fill="x", expand=True)
 
     # Dynamic input: grows from 1 to 6 lines with the text, then scrolls
+    # with a thin styled scrollbar that appears only when it is needed
     # Enter = send, Shift+Enter = new line
+    entry_scroll1 = MinimalScrollbar(entry_wrap, width=6)
+    entry_scroll1.configure(bg=Theme.BG_FIELD)
     self.entry_ex1 = tk.Text(
         entry_wrap,
         height=1,
@@ -1397,8 +1408,15 @@ class SaiAApp:
         bd=0,
         highlightthickness=0,
         font=Theme.FONT_MONO,
+        yscrollcommand=lambda lo, hi: (
+            entry_scroll1.set(lo, hi),
+            entry_scroll1.pack(side="right", fill="y", padx=(0, 6), pady=6)
+            if float(hi) - float(lo) < 0.999
+            else entry_scroll1.pack_forget(),
+        ),
     )
-    self.entry_ex1.pack(fill="x", pady=9, padx=12)
+    entry_scroll1.command = self.entry_ex1.yview
+    self.entry_ex1.pack(side="left", fill="both", expand=True, pady=9, padx=(12, 8))
     _grow1 = lambda e: (
         e.widget.configure(
             height=min(6, max(1, (e.widget.count("1.0", "end", "displaylines") or (1,))[0]))
@@ -1466,6 +1484,9 @@ class SaiAApp:
     icon_div.pack(side="left", fill="y", pady=8)
 
     # Dynamic input: grows from 1 to 6 lines with the text (the window grows with it), then scrolls
+    # with a thin styled scrollbar that appears only when it is needed
+    entry_scroll3 = MinimalScrollbar(bar_container, width=6)
+    entry_scroll3.configure(bg=Theme.BG_FIELD)
     self.entry_ex3 = tk.Text(
         bar_container,
         height=1,
@@ -1478,7 +1499,14 @@ class SaiAApp:
         bd=0,
         highlightthickness=0,
         font=Theme.FONT_MONO,
+        yscrollcommand=lambda lo, hi: (
+            entry_scroll3.set(lo, hi),
+            entry_scroll3.pack(side="left", fill="y", padx=(0, 4), pady=6, after=self.entry_ex3)
+            if float(hi) - float(lo) < 0.999
+            else entry_scroll3.pack_forget(),
+        ),
     )
+    entry_scroll3.command = self.entry_ex3.yview
     self.entry_ex3.pack(side="left", fill="x", expand=True, padx=10, pady=6)
     _grow3 = lambda e: (
         (
@@ -1514,7 +1542,7 @@ class SaiAApp:
   def attach_file(self):
     path = filedialog.askopenfilename(
         parent=self.root,
-        filetypes=ATTACH_FILETYPES,
+        filetypes=[("Supported files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.txt *.py *.html *.md *.pdf")],
     )
     if path:
       self.attached_file = path
@@ -1528,12 +1556,7 @@ class SaiAApp:
     if not query:
       return
 
-    who = self.settings.get("user_nickname") or t("you")
-    self.output_box.configure(state="normal")
-    self.output_box.insert(tk.END, f"{who}  ❯  ", "user_tag")
-    self.output_box.insert(tk.END, f"{query}\n")
-    self.output_box.configure(state="disabled")
-    self.output_box.see(tk.END)
+    self._show_result(query, entry_widget, role="user")
 
     self._start_thinking(entry_widget)
     file_path, self.attached_file = self.attached_file, None
@@ -1542,8 +1565,11 @@ class SaiAApp:
   def _poll_results(self):
     try:
       while True:
-        result, entry_widget = self.worker.results.get_nowait()
-        self._show_result(result, entry_widget)
+        kind, payload, entry_widget = self.worker.results.get_nowait()
+        if kind == "status":
+          self._on_status(payload)
+        else:
+          self._show_result(payload, entry_widget)
     except queue.Empty:
       pass
     self.root.after(100, self._poll_results)
@@ -1552,12 +1578,28 @@ class SaiAApp:
 
   def _start_thinking(self, entry_widget):
     self._pending.add(entry_widget)
+    self._steps = []
+    self._current_status = None
     if self._think_job is None:
       self._think_tick = 0
       self._animate_thinking()
 
+  def _on_status(self, text):
+    """A progress line from the agent: the previous step becomes done, this one becomes current"""
+    if text.startswith("@"):
+      text = t("status_" + text[1:])
+    if text == self._current_status:
+      return
+    if self._current_status and self._current_status not in self._steps:
+      self._steps.append(self._current_status)
+    self._current_status = text
+    if self._pending:
+      self._render_thinking()
+
   def _stop_thinking(self, entry_widget):
     self._pending.discard(entry_widget)
+    self._steps = []
+    self._current_status = None
     entry_widget.configure(state="normal")
     entry_widget.delete("1.0", tk.END)
     entry_widget.event_generate("<<Resize>>")
@@ -1567,51 +1609,150 @@ class SaiAApp:
       self.output_box.delete(ranges[0], ranges[1])
       self.output_box.configure(state="disabled")
 
-  def _animate_thinking(self):
-    if not self._pending:
-      self._think_job = None
-      return
+  def _render_thinking(self):
     frame = self.THINK_FRAMES[self._think_tick % len(self.THINK_FRAMES)]
-    text = f"{t('thinking')}  {frame}"
+    current = self._current_status or t("thinking")
 
-    # Inside the field (shown in both Ex:1 and Ex:3 modes)
+    # Inside the field (shown in both Ex:1 and Ex:3 modes): the current step only
     for e in self._pending:
       e.configure(state="normal")
       e.delete("1.0", tk.END)
-      e.insert("1.0", text)
+      e.insert("1.0", f"{current}  {frame}")
       e.configure(state="disabled")
       e.event_generate("<<Resize>>")
 
-    # Log line updated in place (scrolling doesn't jump)
+    # Log block: finished steps with a check mark, then the current step (updated in place)
+    rows = [f"✓  {step}" for step in self._steps[-6:]] + [f"{current}  {frame}"]
+    block = "SaiA ◆  " + ("\n" + " " * 8).join(rows) + "\n"
     box = self.output_box
-    line = f"SaiA ◆  {text}\n"
     ranges = box.tag_ranges("thinking")
     box.configure(state="normal")
     if ranges:
       start = str(ranges[0])
       box.delete(ranges[0], ranges[1])
-      box.insert(start, line, "thinking")
+      box.insert(start, block, "thinking")
     else:
-      box.insert(tk.END, line, "thinking")
-      box.see(tk.END)
+      box.insert(tk.END, block, "thinking")
     box.configure(state="disabled")
+    # Scroll only when a new row appears (so the animation doesn't make the log jump)
+    if not ranges or len(rows) != self._rows_shown:
+      box.see(tk.END)
+    self._rows_shown = len(rows)
 
+  def _animate_thinking(self):
+    if not self._pending:
+      self._think_job = None
+      return
+    self._render_thinking()
     self._think_tick += 1
     self._think_job = self.root.after(350, self._animate_thinking)
 
-  def _show_result(self, result, entry_widget):
+  def _show_result(self, result, entry_widget, role="bot"):
+    # role="user": the question bubble (right) | role="bot": SaiA's answer bubble (left)
     if result is None:
       result = t("done")
 
-    self._stop_thinking(entry_widget)
+    if role == "bot":
+      self._stop_thinking(entry_widget)
 
-    self.output_box.configure(state="normal")
-    self.output_box.insert(tk.END, "SaiA ◆  ", "bot_tag")
-    self.output_box.insert(tk.END, f"{result}\n\n")
-    self.output_box.configure(state="disabled")
-    self.output_box.see(tk.END)
+    is_user = role == "user"
+    box = self.output_box
+    text_value = str(result).strip()
+    ui_font = tkfont.Font(font=Theme.FONT_UI)
+    line_h = ui_font.metrics("linespace")
+    pad = 12
+    fill_token = Theme.ACCENT_DIM if is_user else Theme.BG_FIELD
+    line_token = Theme.ACCENT if is_user else Theme.BORDER
 
-    entry_widget.focus_set()
+    # Bubble width: as wide as the text needs, up to the width of the window
+    natural = max(ui_font.measure(line) for line in text_value.split("\n")) + 2 * pad + 6
+    bubble_w = max(140, min(max(box.winfo_width(), 300) - 44, natural))
+
+    # Rounded bubble = canvas polygon (smooth corners) + a read-only Text on top
+    # (the answer can still be selected and copied)
+    cv = tk.Canvas(box, bg=Theme.BG_PANEL, highlightthickness=0, bd=0, width=bubble_w, height=line_h + 2 * pad)
+    txt = tk.Text(
+        cv,
+        width=1,
+        height=1,
+        wrap="word",
+        bg=fill_token,
+        fg=Theme.TEXT_PRIMARY,
+        font=Theme.FONT_UI,
+        relief="flat",
+        bd=0,
+        padx=0,
+        pady=0,
+        highlightthickness=0,
+        insertwidth=0,
+        cursor="arrow",
+    )
+    txt.insert("1.0", text_value)
+    txt.configure(state="disabled")
+    win = cv.create_window(pad, pad, anchor="nw", window=txt, width=bubble_w - 2 * pad, height=line_h)
+
+    # Draw the rounded background whenever the bubble changes size
+    cv.bind(
+        "<Configure>",
+        lambda e: (
+            cv.delete("bubble"),
+            cv.create_polygon(
+                [
+                    px
+                    for point in (
+                        (16, 0), (16, 0), (e.width - 17, 0), (e.width - 17, 0), (e.width - 1, 0),
+                        (e.width - 1, 16), (e.width - 1, 16), (e.width - 1, e.height - 17), (e.width - 1, e.height - 17),
+                        (e.width - 1, e.height - 1), (e.width - 17, e.height - 1), (e.width - 17, e.height - 1),
+                        (16, e.height - 1), (16, e.height - 1), (0, e.height - 1), (0, e.height - 17),
+                        (0, e.height - 17), (0, 16), (0, 16), (0, 0),
+                    )
+                    for px in point
+                ],
+                smooth=True,
+                fill=Theme.live(fill_token),
+                outline=Theme.live(line_token),
+                tags="bubble",
+            ),
+            cv.tag_lower("bubble"),
+        ),
+    )
+
+    # Fit the height to the wrapped text (once the real width is known)
+    txt.bind(
+        "<Configure>",
+        lambda e: (
+            lambda n: (
+                cv.itemconfigure(win, height=n * line_h),
+                cv.configure(height=n * line_h + 2 * pad),
+            )
+            if abs(n * line_h - float(cv.itemcget(win, "height"))) > 0.5
+            else None
+        )((txt.count("1.0", "end", "displaylines") or (1,))[0]),
+    )
+
+    # Mouse wheel scrolls the conversation, and a click lets the user select and copy
+    for part in (cv, txt):
+      part.bind("<MouseWheel>", lambda e: (box.yview_scroll(int(-e.delta / 120), "units"), "break")[1])
+    txt.bind("<Button-1>", lambda e: txt.focus_set())
+
+    align = "right_align" if is_user else "left_align"
+    who = (self.settings.get("user_nickname") or t("you")) if is_user else "SaiA ◆"
+    box.configure(state="normal")
+    box.insert(tk.END, f"{who}\n", (align, "name_user" if is_user else "name_bot"))
+    start = box.index("end-1c")
+    box.window_create(tk.END, window=cv)
+    box.insert(tk.END, "\n")
+    box.tag_add(align, start, "end-1c")
+    box.tag_add("gap", start, "end-1c")
+    box.configure(state="disabled")
+    self._bubbles.append((cv, win, natural, pad))
+
+    box.see(tk.END)
+    self.root.after(80, lambda: box.see(tk.END))
+    self.root.after(300, lambda: box.see(tk.END))
+
+    if role == "bot":
+      entry_widget.focus_set()
 
   def _place_root(self, width, height):
     geo = f"{width}x{height}"
@@ -1663,6 +1804,8 @@ class SaiAApp:
     self.output_box.tag_configure("user_tag", foreground=Theme.TEXT_SECONDARY)
     self.output_box.tag_configure("bot_tag", foreground=Theme.ACCENT_HOVER)
     self.output_box.tag_configure("thinking", foreground=Theme.TEXT_MUTED)
+    self.output_box.tag_configure("name_user", foreground=Theme.TEXT_SECONDARY)
+    self.output_box.tag_configure("name_bot", foreground=Theme.ACCENT_HOVER)
 
   def toggle_theme(self):
     """Switches between light and dark mode for all open windows and saves the choice"""
