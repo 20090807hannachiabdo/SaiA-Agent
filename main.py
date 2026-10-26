@@ -7,7 +7,10 @@ from ui.app_gui import start_app
 
 
 def start_web_server():
-    run_web_server()
+    try:
+        run_web_server()
+    except Exception:
+        pass
 
 
 def create_database():
@@ -16,17 +19,17 @@ def create_database():
 
 
 def main():
-    # 1. تهيئة قاعدة البيانات
+    # 1. Initialize and ensure database schema
     create_database()
 
-    # 2. تشغيل سيرفر ويب في خيط ثانوي (daemon)
+    # 2. Start Flask server in background thread
     web_server_thread = threading.Thread(target=start_web_server, daemon=True)
     web_server_thread.start()
 
-    # 3. تشغيل الواجهة الرسومية (Main Thread)
+    # 3. Launch desktop GUI application
     start_app()
 
-    # 4. إنهاء العملية وكل الخيوط التابعة فور إغلاق نافذة Tkinter
+    # 4. Clean exit
     os._exit(0)
 
 
