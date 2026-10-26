@@ -1,57 +1,149 @@
+"""
+SaiA Execution Workflow & Scheduler
+Handles intelligent direct responses (Q&A/chat without creating files),
+PowerShell command sanitization (stripping conversational prefixes and fences),
+and automated execution for emails and documents.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from core.api_saia import mml, STEP_MARKER
+from typing import Callable, List, Optional
+
+from core.api_saia import STEP_MARKER, mml
+from storage.database import Database
 
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
-
-# The SaiA application folder: generated commands must never touch it
 APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Commands that download from the internet may need much longer than 180 seconds
 DOWNLOAD_MARKERS = ("yt_dlp", "yt-dlp", "urlretrieve", "urlopen", "invoke-webrequest", "start-bitstransfer")
 DEFAULT_TIMEOUT = 180
 DOWNLOAD_TIMEOUT = 1200
 
 
+def clean_powershell_command(raw_command: str) -> str:
+    """Strips conversational text, markdown fences, and isolates pure PowerShell code."""
+    cmd = raw_command.strip()
+
+    # 1. Strip markdown fences if present
+    if "```" in cmd:
+        lines = cmd.split("\n")
+        filtered = []
+        inside = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                inside = not inside
+                continue
+            if inside:
+                filtered.append(line)
+        if filtered:
+            cmd = "\n".join(filtered).strip()
+
+    # 2. Drop any accidental conversational introductory sentences
+    lines = cmd.split("\n")
+    valid_starters = (
+        "$", "@", "&", "python", "try", "[", "import", "#",
+        "set-", "get-", "invoke-", "start-", "new-", "remove-",
+        "copy-", "move-", "test-", "write-", "ipconfig", "netsh", "taskkill"
+    )
+    start_idx = 0
+    for idx, line in enumerate(lines):
+        line_clean = line.strip().lower()
+        if any(line_clean.startswith(prefix) for prefix in valid_starters):
+            start_idx = idx
+            break
+
+    return "\n".join(lines[start_idx:]).strip()
+
+
 class ai_agent:
-    def __init__(self, name="AI Agent", role="assistant"):
+    def __init__(
+        self,
+        name: str = "SaiA Agent",
+        role_id: str = "student",
+        session_id: Optional[str] = None,
+    ):
         self.name = name
-        self.role = role
+        self.role_id = role_id
+        self.db = Database()
+        self.db.create_database()
+        self.session_id = session_id or self.db.create_session("محادثة جديدة", role_id)
         self.mml = mml()
+        self._emergency_aborted = False
+
+    def set_session(self, session_id: str, role_id: Optional[str] = None) -> None:
+        self.session_id = session_id
+        if role_id:
+            self.role_id = role_id
+
     @staticmethod
-    def _emit(on_status, text):
-        # Reporting progress must never break the task itself
+    def _emit(on_status: Optional[Callable[[str], None]], text: str) -> None:
         if on_status and text:
             try:
                 on_status(text)
             except Exception:
                 pass
-    def respond(self, user_input, file_path=None):
-        return self.mml.generate_command(user_input, file_path)
-    def _collect_output(self, process, timeout, on_status=None, steps=None):
-        # Reads the output line by line while the command is still running:
-        # SAIA_STEP lines are reported live and removed from the final output
-        errors = []
+
+    def _monitor_mouse_failsafe(self, stop_event: threading.Event, process: subprocess.Popen) -> None:
+        if sys.platform != "win32":
+            return
+        user32 = ctypes.windll.user32
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        pt = POINT()
+        screen_width = user32.GetSystemMetrics(0)
+        while not stop_event.is_set():
+            user32.GetCursorPos(ctypes.byref(pt))
+            if pt.x >= screen_width - 8:
+                self._emergency_aborted = True
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
+                except Exception:
+                    pass
+                break
+            time.sleep(0.06)
+
+    def _collect_output(
+        self,
+        process: subprocess.Popen,
+        timeout: int,
+        on_status: Optional[Callable[[str], None]] = None,
+        steps: Optional[List[str]] = None,
+    ) -> str:
+        errors: List[str] = []
         err_reader = threading.Thread(target=lambda: errors.append(process.stderr.read()), daemon=True)
         err_reader.start()
-        timed_out = []
+
+        stop_failsafe = threading.Event()
+        failsafe_thread = threading.Thread(target=self._monitor_mouse_failsafe, args=(stop_failsafe, process), daemon=True)
+        failsafe_thread.start()
+
+        timed_out: List[bool] = []
+
         def stop_process():
             timed_out.append(True)
             try:
                 if sys.platform == "win32":
-                    # Also stops the child processes (for example the Python interpreter)
                     subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
                 process.kill()
             except Exception:
                 pass
+
         timer = threading.Timer(timeout, stop_process)
         timer.daemon = True
         timer.start()
-        lines = []
+
+        lines: List[str] = []
         try:
             for line in process.stdout:
                 text = line.strip()
@@ -66,25 +158,35 @@ class ai_agent:
             process.wait()
         finally:
             timer.cancel()
-        err_reader.join(timeout=5)
+            stop_failsafe.set()
+
+        err_reader.join(timeout=3)
+        if self._emergency_aborted:
+            self._emergency_aborted = False
+            return "Error executing command: [EMERGENCY FAIL-SAFE TRIGGERED] تم إيقاف الأمر بحركة طوارئ الفأرة."
         if timed_out:
-            return f"Error: the command did not finish within {timeout} seconds."
+            return f"Error: The command did not complete within {timeout} seconds."
         if process.returncode != 0:
             return f"Error executing command: {''.join(errors)}"
         return "".join(lines)
-    def execute_command(self, command, on_status=None, steps=None):
-        # Safety: refuse commands that write into the SaiA application folder itself
-        # (the Python interpreter path is removed first because it may live in a venv inside it)
+
+    def execute_command(
+        self,
+        command: str,
+        on_status: Optional[Callable[[str], None]] = None,
+        steps: Optional[List[str]] = None,
+    ) -> str:
+        command = clean_powershell_command(command)
+        if not command:
+            return "Error executing command: Empty or non-executable command."
+
         checked = command.replace("\\", "/").lower()
         for exe in {sys.executable, "python"}:
             checked = checked.replace(exe.replace("\\", "/").lower(), "")
         if APP_ROOT.replace("\\", "/").lower() in checked:
-            return (
-                "Error executing command: the command used the SaiA application folder "
-                f"({APP_ROOT}). Files and folders must be created only inside the Downloads folder: {DOWNLOADS}."
-            )
+            return f"Error executing command: Forbidden application folder access. Target Downloads: {DOWNLOADS}."
+
         timeout = DOWNLOAD_TIMEOUT if any(m in command.lower() for m in DOWNLOAD_MARKERS) else DEFAULT_TIMEOUT
-        # The command is run from a script file (no command-line length limit, Arabic text stays intact)
         script = os.path.join(tempfile.gettempdir(), "saia_command.ps1")
         with open(script, "w", encoding="utf-8-sig") as f:
             f.write(
@@ -94,8 +196,10 @@ class ai_agent:
                 "$env:PYTHONIOENCODING = 'utf-8'\n"
                 "$env:PYTHONUNBUFFERED = '1'\n"
                 "$ErrorActionPreference = 'Stop'\n"
-                + command + "\nif ($LASTEXITCODE) { exit $LASTEXITCODE }\n"
+                + command
+                + "\nif ($LASTEXITCODE) { exit $LASTEXITCODE }\n"
             )
+
         try:
             process = subprocess.Popen(
                 ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script],
@@ -104,64 +208,134 @@ class ai_agent:
             )
         except OSError as exc:
             return f"Error executing command: {exc}"
+
         return self._collect_output(process, timeout, on_status, steps)
-    def run_workflow(self, user_input, file_path=None, on_status=None):
-        # on_status(text) receives live progress: model steps, or "@preparing", "@fixing", "@finishing", "@media"
+
+    def run_workflow(
+        self,
+        user_input: str,
+        file_path: Optional[str] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+    ) -> str:
         self._emit(on_status, "@preparing")
-        started = time.time()
-        raw = self.respond(user_input, file_path).strip()
+
+        # 1. Regex memory extraction for user facts
+        m_age = re.search(r"(?:عمري|عمرِي)\s*(?:هو)?\s*[:=]?\s*(\d+)(?:\s*سنة|\s*عام)?", user_input)
+        if m_age:
+            self.db.set_longterm_memory("user_age", f"{m_age.group(1)} سنة", category="personal", importance=5)
+
+        # 2. Dynamic Auto-Naming
+        current_history = self.db.get_session_history(self.session_id, limit=2)
+        if len(current_history) <= 1:
+            clean_first_line = user_input.strip().split("\n")[0]
+            dynamic_title = clean_first_line[:32] + ("..." if len(clean_first_line) > 32 else "")
+            self.db.update_session_title(self.session_id, dynamic_title)
+
+        # 3. Detect historical context queries
+        is_asking_past = any(
+            kw in user_input.lower()
+            for kw in (
+                "السابقة", "السابق", "قبل", "تتذكر", "فاكر", "قلتلك", "سابقا",
+                "عمري", "اسمي", "previous", "earlier", "remember", "past", "last chat"
+            )
+        )
+        past_sessions_context = self.db.get_past_sessions_history(self.session_id, limit=14) if is_asking_past else []
+
+        history = self.db.get_session_history(self.session_id, limit=8)
+        role_info = self.db.get_role(self.role_id)
+        memories = self.db.get_longterm_memories(limit=15)
+
+        self.db.save_message(self.session_id, "user", user_input, file_path)
+
+        raw = self.mml.generate_command(
+            user_request=user_input,
+            file_path=file_path,
+            history=history,
+            role_info=role_info,
+            longterm_memories=memories,
+            past_sessions_context=past_sessions_context,
+        ).strip()
+
+        # Parse memory tags if returned
+        if "####SAIA_MEMORY####" in raw:
+            raw, _, mem_block = raw.partition("####SAIA_MEMORY####")
+            raw = raw.strip()
+            try:
+                mem_dict = json.loads(mem_block.strip())
+                if isinstance(mem_dict, dict):
+                    for k, v in mem_dict.items():
+                        self.db.set_longterm_memory(str(k), str(v), category="personal")
+            except Exception:
+                pass
+
+        # CASE 1: Direct Chat Response
+        if raw.startswith("####SAIA_DIRECT####"):
+            direct_ans = raw[len("####SAIA_DIRECT####"):].strip()
+            self.db.save_message(self.session_id, "assistant", direct_ans)
+            return direct_ans
+
+        # CASE 2: Media generation
         if raw.startswith("####SAIA_MEDIA####"):
-            # Image / speech / video request: made by the most suitable Gemini media model (no PowerShell)
             self._emit(on_status, "@media")
             head, _, media_message = raw[len("####SAIA_MEDIA####"):].partition("####SAIA_MESSAGE####")
             media_kind, _, media_prompt = head.strip().partition("\n")
             media_path = self.mml.generate_command(
-                user_input, file_path, media=media_kind.strip().lower(), media_prompt=media_prompt.strip()
+                user_input, file_path=file_path, media=media_kind.strip().lower(), media_prompt=media_prompt.strip()
             )
-            return f"{media_message.strip()}\n\n{media_path}".strip()
+            result_text = f"{media_message.strip()}\n\n{media_path}".strip()
+            self.db.save_message(self.session_id, "assistant", result_text)
+            return result_text
+
+        # CASE 3: Fallback plain conversational text
+        if "####SAIA_MESSAGE####" not in raw and not any(
+            marker in raw.lower() for marker in ("powershell", "write-output", "set-content", "@'", "python", "get-", "test-", "$")
+        ):
+            self.db.save_message(self.session_id, "assistant", raw)
+            return raw
+
+        # CASE 4: Action/PowerShell Execution
         command, _, message = raw.partition("####SAIA_MESSAGE####")
-        command = command.strip()
-        generated = time.time() - started
+        command = clean_powershell_command(command)
+
         if command:
-            started = time.time()
-            steps = []
+            steps: List[str] = []
             execution_result = self.execute_command(command, on_status, steps)
-            # Self-repair: if the command failed, send the real error back to the model and retry (up to 2 times)
-            for attempt in range(2):
+            for _ in range(2):
                 if not (execution_result or "").startswith("Error executing command"):
                     break
                 self._emit(on_status, "@fixing")
                 try:
-                    fixed, sep, fixed_message = self.mml.generate_command(
-                        user_input, file_path, command=command, output=execution_result, fix=True
+                    fixed, _, fixed_msg = self.mml.generate_command(
+                        user_input, file_path=file_path, command=command, output=execution_result, fix=True
                     ).partition("####SAIA_MESSAGE####")
                 except Exception:
                     break
-                if not fixed.strip():
+                fixed_cleaned = clean_powershell_command(fixed)
+                if not fixed_cleaned:
                     break
-                command, message = fixed.strip(), fixed_message
+                command, message = fixed_cleaned, fixed_msg
                 execution_result = self.execute_command(command, on_status, steps)
-            # Debug log: the last executed command, how long it took, its progress steps, and its output
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_command.txt"), "w", encoding="utf-8") as log:
-                log.write(
-                    f"[model: {generated:.1f}s | PowerShell: {time.time() - started:.1f}s]\n\n{command}\n\n"
-                    f"--- steps ---\n" + "\n".join(steps) + f"\n\n--- output ---\n{execution_result}"
-                )
-            # The command prints SAIA_OK only after it verified its own result
+
             execution_result = execution_result or ""
             failed = execution_result.startswith("Error")
             verified = "SAIA_OK" in execution_result and not failed
             execution_result = execution_result.replace("SAIA_OK", "").strip()
+
             if message.strip() and verified and not execution_result:
-                # Verified silent success: use the message written together with the command (no second model call)
-                return message.strip()
+                resp = message.strip()
+                self.db.save_message(self.session_id, "assistant", resp)
+                return resp
+
             status = "STATUS: VERIFIED" if verified else "STATUS: NOT VERIFIED"
             self._emit(on_status, "@finishing")
             try:
-                return self.mml.generate_command(user_input, command=command, output=f"{status}\n{execution_result}")
+                final_res = self.mml.generate_command(user_input, command=command, output=f"{status}\n{execution_result}")
             except Exception:
-                if failed:
-                    return "There was a problem and the task was not completed. " + execution_result[:300]
-                return (execution_result or "").strip() or "The task could not be confirmed."
+                final_res = f"Action completed with errors: {execution_result[:300]}" if failed else execution_result or "Task completed."
+
+            self.db.save_message(self.session_id, "assistant", final_res)
+            return final_res
         else:
-            return "No command generated."
+            resp = raw
+            self.db.save_message(self.session_id, "assistant", resp)
+            return resp
