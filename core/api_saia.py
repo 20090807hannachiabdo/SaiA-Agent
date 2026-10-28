@@ -7,17 +7,19 @@ Full autonomous suite:
 - Media Generation (Images, Audio/TTS)
 - Persistent Long-Term Memory & Cross-Session Recall
 - Desktop Automation, Notifications, and System Control
+- Support for Gemini and Local/Edge Google Gemma Models
 """
-
 
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -40,6 +42,7 @@ logger = logging.getLogger("SaiA")
 class Cancelled(BaseException):
     """Raised inside a request that the user cancelled. Like asyncio.CancelledError it derives from
     BaseException, so the many `except Exception:` blocks in the app cannot swallow it by accident."""
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -166,13 +169,12 @@ def save_env_values(values: Dict[str, str]) -> None:
         else:
             os.environ.pop(key, None)
 
+
 MEDIA_MODELS = {
     "audio": ("gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"),
     "image": ("gemini-2.5-flash-image", "gemini-3.1-flash-lite-image", "gemini-nano-banana-2.1"),
 }
 
-# Prebuilt Gemini TTS voices offered in Settings -> Voice (name -> gender).
-# Add any other Gemini voice name here and it appears in the picker automatically.
 VOICES = {
     "Kore": "female", "Zephyr": "female", "Leda": "female", "Aoede": "female",
     "Callirrhoe": "female", "Sulafat": "female", "Vindemiatrix": "female", "Achernar": "female",
@@ -180,11 +182,10 @@ VOICES = {
     "Algieba": "male", "Schedar": "male", "Umbriel": "male", "Enceladus": "male",
 }
 DEFAULT_VOICE = "Kore"
-MEDIA_VOICE = DEFAULT_VOICE  # kept for backward compatibility; use get_media_voice()
+MEDIA_VOICE = DEFAULT_VOICE
 
 
 def set_media_voice(name: str) -> str:
-    """Sets the voice used for spoken answers and generated audio. Unknown names fall back to the default."""
     global MEDIA_VOICE
     MEDIA_VOICE = name if name in VOICES else DEFAULT_VOICE
     return MEDIA_VOICE
@@ -197,9 +198,9 @@ def get_media_voice() -> str:
 def voice_gender(name: str) -> str:
     return VOICES.get(name, "female")
 
+
 FALLBACK_MODEL = "gemini-3.5-flash"
 STEP_MARKER = "SAIA_STEP:"
-
 # --------------------------------------------------
 # Complete Comprehensive System Prompt
 # --------------------------------------------------
@@ -233,68 +234,72 @@ MODE 1: DIRECT CHAT & Q&A (NO FILES, NO COMMANDS)
 f(x) = 2x + 3
 range: -10, 10
 x: 3.5
-```
-  One expression per line (max 3, named f, g, h). 'range' and 'x' (initial value) are optional. Variable is x; use ^ for
-  powers and sin cos tan sqrt ln log exp abs pi. The app draws everything itself: never add ASCII graphs or value tables.
-  MATH: write formulas the way a person writes them: x², √x, a/b, ≤, ≥, ≠, ±, ·, π, ∞. Prefer plain linear text;
-  if you must use LaTeX put it inside $...$ (the app converts it). Use Western digits 0-9 only. Never leave raw backslash commands outside $...$.
-
+One expression per line (max 3, named f, g, h). 'range' and 'x' (initial value) are optional. Variable is x; use ^ for
+powers and sin cos tan sqrt ln log exp abs pi. The app draws everything itself: never add ASCII graphs or value tables.
+MATH: write formulas the way a person writes them: x², √x, a/b, ≤, ≥, ≠, ±, ·, π, ∞. Prefer plain linear text;
+if you must use LaTeX put it inside 
+.
+.
+.
+...
+ (the app converts it). Use Western digits 0-9 only. Never leave raw backslash commands outside 
+.
+.
+.
+...
+.
 MODE 2: MEDIA GENERATION (IMAGE / AUDIO / VIDEO)
-- If the user asks to GENERATE a new image, picture, drawing, logo, speech/voiceover:
-  Return ONLY:
+If the user asks to GENERATE a new image, picture, drawing, logo, speech/voiceover:
+Return ONLY:
 ####SAIA_MEDIA####<image or audio>
 <detailed prompt in English for image, or exact speech text for audio>
 ####SAIA_MESSAGE####
 <Short 1-2 sentence confirmation in user's language>
-
 MODE 3: POWERSHELL COMMAND EXECUTION (ACTIONS & FILES)
-- Use this mode ONLY when the user asks for a real action:
-  1. Sending an EMAIL via Gmail.
-  2. EXPLICITLY creating, saving, exporting, or downloading a FILE (Word, Excel, PPTX, PDF, Zip, Code file).
-  3. System actions (desktop wallpaper, notifications, WiFi inspection, scheduled reminders).
-- Return ONLY:
-1. One valid PowerShell command (START DIRECTLY with executable code, NEVER add text or markdown before it).
-2. The exact separator:
+Use this mode ONLY when the user asks for a real action:
+Sending an EMAIL via Gmail.
+EXPLICITLY creating, saving, exporting, or downloading a FILE (Word, Excel, PPTX, PDF, Zip, Code file).
+System actions (desktop wallpaper, notifications, WiFi inspection, scheduled reminders).
+Return ONLY:
+One valid PowerShell command (START DIRECTLY with executable code, NEVER add text or markdown before it).
+The exact separator:
 ####SAIA_MESSAGE####
-3. A brief user-facing message (1-2 sentences) in the user's language confirming success.
-
+A brief user-facing message (1-2 sentences) in the user's language confirming success.
 VERIFICATION (Mandatory for file/state changes):
-- Check deliverables exist and are non-empty. If a file was created or saved, print its full absolute path on its own line
-  (the app turns it into a file card with Open / Save a copy). Only on complete success, print: SAIA_OK.
+Check deliverables exist and are non-empty. If a file was created or saved, print its full absolute path on its own line
+(the app turns it into a file card with Open / Save a copy). Only on complete success, print: SAIA_OK.
 PROGRESS STEPS:
-- Print "SAIA_STEP: <short 2-6 words present-tense description>" before each major phase starts.
-
-MEMORY & CONTINUITY (CRITICAL):
-- You HAVE persistent memory and access to previous conversations.
-- NEVER claim that you do not remember or do not store data. Use "USER PERSISTENT LONG-TERM MEMORY"
-  and "PAST CONVERSATIONS ARCHIVE" to answer user questions about past chats, their age, name, etc.
-- When the user tells you new personal details, you may append at the very end:
-  ####SAIA_MEMORY####{"key": "value"}
-
+Print "SAIA_STEP: <short 2-6 words present-tense description>" before each major phase starts.
+MEMORY & CONVERSATION CONTINUITY (CRITICAL):
+You HAVE full memory and active continuous access to the ongoing conversation turns and past history.
+NATURAL CONTEXT RECALL: When the user asks if you remember the conversation context, what you were just talking about,
+or to continue where you left off, ALWAYS summarize the ACTIVE TOPICS, CODE, FORMULAS, and DISCUSSION naturally and conversationally.
+DO NOT robotically recite the user's age, name, or metadata unless they explicitly ask ("What is my name?" or "How old am I?").
+Treat known user facts as subtle background knowledge to personalize your tone, not as a checklist to dump into responses.
+When the user tells you new personal details, you may append at the very end:
+####SAIA_MEMORY####{"key": "value"}
 TOOLBOX & METHODS FOR ACTIONS:
-
-1. EMAIL (Gmail via yagmail):
-- Credentials are in the process environment. Read them with:
-  sender = os.environ.get("SENDER_EMAIL")
-  password = os.environ.get("APP_PASSWRD", "").replace(" ", "")
-  If the user says "to me", use sender.
-- Send code structure:
+EMAIL (Gmail via yagmail):
+Credentials are in the process environment. Read them with:
+sender = os.environ.get("SENDER_EMAIL")
+password = os.environ.get("APP_PASSWRD", "").replace(" ", "")
+If the user says "to me", use sender.
+Send code structure:
 @'
 import os
 import yagmail
 sender = os.environ.get("SENDER_EMAIL")
 password = os.environ.get("APP_PASSWRD", "").replace(" ", "")
 if not sender or not password:
-    raise ValueError("Gmail credentials missing from environment.")
+raise ValueError("Gmail credentials missing from environment.")
 yag = yagmail.SMTP(sender, password)
 yag.send(to=recipients, subject=subject, contents=body, attachments=attachments_list_or_None)
 yag.close()
 print("SAIA_OK")
 '@ | & 'python' -u -
-
-2. OFFICE DOCUMENTS (Python method):
-- Use openpyxl (Excel), python-docx (Word), python-pptx (PowerPoint).
-- Run Python inline via here-string piped to the python interpreter:
+OFFICE DOCUMENTS (Python method):
+Use openpyxl (Excel), python-docx (Word), python-pptx (PowerPoint).
+Run Python inline via here-string piped to the python interpreter:
 @'
 <python code>
 '@ | & 'python' -u -
@@ -302,25 +307,19 @@ print("SAIA_OK")
 - For Excel: format tables, bold headers, set column widths. For Arabic: ws.sheet_view.rightToLeft = True.
 - For Word: format headings, styles, margins. For Arabic: set <w:bidi/> and Arial font.
 - For PowerPoint: 16:9 widescreen layout, blank slide layout, styled cards and clear large fonts.
-
-3. PDF GENERATION:
-- Write fully styled HTML into $env:TEMP, then convert via headless Microsoft Edge:
-  & $edge --headless --disable-gpu --no-pdf-header-footer --print-to-pdf="<pdf_path>" "<html_path>"
-
-4. ARCHIVING & COMPRESSION:
-- Zip/Unzip via Python zipfile. Password-protected zip via pyzipper.
-
-5. DOWNLOADS:
-- YouTube/Video via yt-dlp to Downloads folder. Direct URLs via urllib.request.
-
-6. DESKTOP NOTIFICATIONS & WALLPAPER:
-- Windows Toast notifications via Windows.UI.Notifications.
-- Wallpaper change via ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3).
-
-7. SCREEN & MOUSE FAIL-SAFE:
-- In mouse automation, abort immediately if cursor reaches the extreme right edge (x >= GetSystemMetrics(0) - 8).
+PDF GENERATION:
+Write fully styled HTML into $env:TEMP, then convert via headless Microsoft Edge:
+& $edge --headless --disable-gpu --no-pdf-header-footer --print-to-pdf="<pdf_path>" "<html_path>"
+ARCHIVING & COMPRESSION:
+Zip/Unzip via Python zipfile. Password-protected zip via pyzipper.
+DOWNLOADS:
+YouTube/Video via yt-dlp to Downloads folder. Direct URLs via urllib.request.
+DESKTOP NOTIFICATIONS & WALLPAPER:
+Windows Toast notifications via Windows.UI.Notifications.
+Wallpaper change via ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3).
+SCREEN & MOUSE FAIL-SAFE:
+In mouse automation, abort immediately if cursor reaches the extreme right edge (x >= GetSystemMetrics(0) - 8).
 """
-
 REPLY_PROMPT = """
 You are SaiA, explaining the outcome of an executed action.
 Review the command output provided by the user.
@@ -328,7 +327,6 @@ Be concise, clear, and direct in the user's language.
 Plain text only, without markdown code blocks.
 Never write file paths in your answer: the app shows the created file as a card by itself.
 """
-
 
 class mml:
     def __init__(
@@ -378,6 +376,50 @@ class mml:
             self._client_key = api_key
         return self._client
 
+    def _query_local_ollama(self, model_name: str, prompt: str, system: str = "") -> Optional[str]:
+        """Tries to query a local Ollama instance if active for local Gemma model runs."""
+        tag_map = {
+            "gemma-2-2b-it": ["gemma2:2b", "gemma:2b", "gemma2"],
+            "gemma-2-9b-it": ["gemma2:9b", "gemma2:latest", "gemma2"],
+            "gemma-2-27b-it": ["gemma2:27b", "gemma2:latest"],
+        }
+        possible_tags = tag_map.get(model_name, [model_name])
+        try:
+            req = urllib.request.Request("http://127.0.0.1:11434/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=0.8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                installed = [m.get("name", "") for m in data.get("models", [])]
+
+            target_tag = None
+            for tag in possible_tags:
+                for inst in installed:
+                    if tag in inst or inst in tag:
+                        target_tag = inst
+                        break
+                if target_tag:
+                    break
+
+            if not target_tag:
+                return None
+
+            payload = {
+                "model": target_tag,
+                "prompt": prompt,
+                "system": system,
+                "stream": False,
+            }
+            req_post = urllib.request.Request(
+                "http://127.0.0.1:11434/api/generate",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req_post, timeout=180) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                return res_data.get("response", "").strip()
+        except Exception:
+            return None
+
     def _get_system_context(
         self,
         role_info: Optional[Dict[str, Any]] = None,
@@ -406,7 +448,7 @@ SPECIALIST GUIDANCE:
                 for m in longterm_memories
             ]
             memory_section = f"""
-USER PERSISTENT LONG-TERM MEMORY (Known user facts):
+USER BACKGROUND DETAILS (Subtle personal facts):
 {chr(10).join(mem_items)}
 """
 
@@ -417,7 +459,7 @@ USER PERSISTENT LONG-TERM MEMORY (Known user facts):
                 for m in past_sessions_context
             ]
             past_section = f"""
-PAST CONVERSATIONS ARCHIVE (Historical context):
+HISTORICAL CHATS LOG:
 {chr(10).join(p_lines)}
 """
 
@@ -474,7 +516,7 @@ SaiA application folder: {PROJECT_ROOT}
         history_section = ""
         if history:
             turns = [f"{'User' if item.get('role') == 'user' else 'SaiA'}: {item.get('content', '')}" for item in history]
-            history_section = f"\nCURRENT SESSION TURNS:\n{chr(10).join(turns[-10:])}\n"
+            history_section = f"\nCURRENT ACTIVE CONVERSATION TURNS:\n{chr(10).join(turns)}\n"
 
         prompt = f"""
 {context}
@@ -586,17 +628,41 @@ Determine the correct Mode:
         last_error = None
         for current_model in models_to_try:
             temp = 0.2 if is_reply_mode else 0.0
+            is_gemma = "gemma" in current_model.lower()
+
+            # Attempt local execution if local Ollama runtime is active with Gemma
+            if is_gemma:
+                self._raise_if_cancelled()
+                prompt_str = contents[0] if contents and isinstance(contents[0], str) else user_request
+                local_ans = self._query_local_ollama(current_model, prompt_str, system=system_instruction)
+                if local_ans:
+                    self._raise_if_cancelled()
+                    return local_ans
+
             for attempt in range(1, self.max_retries + 1):
                 self._raise_if_cancelled()
                 try:
-                    response = self.client.models.generate_content(
-                        model=current_model,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
+                    if is_gemma:
+                        # Gemma models do not accept system_instruction in config; prepend it directly
+                        run_contents = list(contents)
+                        if system_instruction and run_contents and isinstance(run_contents[0], str):
+                            run_contents[0] = f"{system_instruction}\n\n---\n\n{run_contents[0]}"
+                        config = types.GenerateContentConfig(
+                            temperature=temp,
+                            max_output_tokens=min(self.max_output_tokens, 8192),
+                        )
+                    else:
+                        run_contents = contents
+                        config = types.GenerateContentConfig(
                             system_instruction=system_instruction,
                             temperature=temp,
                             max_output_tokens=self.max_output_tokens,
-                        ),
+                        )
+
+                    response = self.client.models.generate_content(
+                        model=current_model,
+                        contents=run_contents,
+                        config=config,
                     )
                     text = self._extract_response_text(response)
                     if text:
