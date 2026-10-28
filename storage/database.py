@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 APP_NAME = "SaiA"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 PREF_COLUMNS = ("theme", "language", "user_nickname", "selected_model", "active_role")
 
 CORE_SCHEMA_SQL = """
@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS ai_model (
 );
 INSERT OR IGNORE INTO ai_model (id, model_name, description, version) VALUES
 ('gemini-3.5-flash-lite', 'Gemini 3.5 Flash Lite', 'Ultra-fast, tool-optimized model', '3.5.0'),
-('gemini-3.5-flash', 'Gemini 3.5 Flash', 'Deep reasoning and workflow orchestration', '3.5.0');
+('gemini-3.5-flash', 'Gemini 3.5 Flash', 'Deep reasoning and workflow orchestration', '3.5.0'),
+('gemma-2-2b-it', 'Gemma 2 2B (Local/Fast)', 'Google ultra-lightweight & fast open model', '2.0.0'),
+('gemma-2-9b-it', 'Gemma 2 9B (Local/Smart)', 'Google high-performance balanced open model', '2.0.0'),
+('gemma-2-27b-it', 'Gemma 2 27B (Local/Pro)', 'Google high-capacity deep reasoning open model', '2.0.0');
 
 CREATE TABLE IF NOT EXISTS specialist_roles (
     id TEXT PRIMARY KEY,
@@ -163,6 +166,19 @@ class Database:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(user_preferences)").fetchall()]
             if "active_role" not in cols:
                 conn.execute("ALTER TABLE user_preferences ADD COLUMN active_role TEXT DEFAULT 'student'")
+
+            # Guarantee all Gemma models are present in pre-existing databases
+            gemma_models = [
+                ('gemma-2-2b-it', 'Gemma 2 2B (Local/Fast)', 'Google ultra-lightweight & fast open model', '2.0.0'),
+                ('gemma-2-9b-it', 'Gemma 2 9B (Local/Smart)', 'Google high-performance balanced open model', '2.0.0'),
+                ('gemma-2-27b-it', 'Gemma 2 27B (Local/Pro)', 'Google high-capacity deep reasoning open model', '2.0.0'),
+            ]
+            for m in gemma_models:
+                conn.execute(
+                    "INSERT OR IGNORE INTO ai_model (id, model_name, description, version) VALUES (?, ?, ?, ?)",
+                    m,
+                )
+
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
         finally:
