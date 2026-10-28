@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS ai_model (
 );
 INSERT OR IGNORE INTO ai_model (id, model_name, description, version) VALUES
 ('gemini-3.5-flash-lite', 'Gemini 3.5 Flash Lite', 'Ultra-fast, tool-optimized model', '3.5.0'),
-('gemini-3.5-flash', 'Gemini 3.5 Flash', 'Deep reasoning and workflow orchestration', '3.5.0');
+('gemini-3.5-flash', 'Gemini 3.5 Flash', 'Deep reasoning and workflow orchestration', '3.5.0'),
+('gemma-2-2b-it', 'Gemma 2 2B (Local/Fast)', 'Google ultra-lightweight & fast open model', '2.0.0'),
+('gemma-2-9b-it', 'Gemma 2 9B (Local/Smart)', 'Google high-performance balanced open model', '2.0.0'),
+('gemma-2-27b-it', 'Gemma 2 27B (Local/Pro)', 'Google high-capacity deep reasoning open model', '2.0.0');
 
 CREATE TABLE IF NOT EXISTS specialist_roles (
     id TEXT PRIMARY KEY,
