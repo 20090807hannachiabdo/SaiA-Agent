@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Callable, List, Optional
 
-from core.api_saia import STEP_MARKER, mml
+from core.api_saia import SAIA_DATA_DIR, STEP_MARKER, Cancelled, extract_file_paths, mml
 from storage.database import Database
 
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -64,6 +64,47 @@ def clean_powershell_command(raw_command: str) -> str:
     return "\n".join(lines[start_idx:]).strip()
 
 
+class RunToken:
+    """One question being processed. cancel() stops it: the model request is abandoned at its next
+    checkpoint and a running PowerShell command (with its child processes) is killed."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.proc: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+
+    @property
+    def cancelled(self) -> bool:
+        return self.event.is_set()
+
+    def check(self) -> None:
+        if self.event.is_set():
+            raise Cancelled()
+
+    def attach(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self.proc = proc
+        if self.event.is_set():
+            self._kill(proc)
+
+    def cancel(self) -> None:
+        self.event.set()
+        with self._lock:
+            proc = self.proc
+        if proc is not None:
+            threading.Thread(target=self._kill, args=(proc,), daemon=True).start()
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is None:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+                proc.kill()
+        except Exception:
+            pass
+
+
 class ai_agent:
     def __init__(
         self,
@@ -78,6 +119,13 @@ class ai_agent:
         self.session_id = session_id or self.db.create_session("محادثة جديدة", role_id)
         self.mml = mml()
         self._emergency_aborted = False
+        self._run: Optional[RunToken] = None
+
+    def cancel(self) -> None:
+        """Cancels the question that is being processed right now (safe to call from the UI thread)."""
+        run = self._run
+        if run is not None:
+            run.cancel()
 
     def set_session(self, session_id: str, role_id: Optional[str] = None) -> None:
         self.session_id = session_id
@@ -119,6 +167,7 @@ class ai_agent:
         timeout: int,
         on_status: Optional[Callable[[str], None]] = None,
         steps: Optional[List[str]] = None,
+        run: Optional[RunToken] = None,
     ) -> str:
         errors: List[str] = []
         err_reader = threading.Thread(target=lambda: errors.append(process.stderr.read()), daemon=True)
@@ -161,6 +210,8 @@ class ai_agent:
             stop_failsafe.set()
 
         err_reader.join(timeout=3)
+        if run is not None and run.cancelled:
+            raise Cancelled()
         if self._emergency_aborted:
             self._emergency_aborted = False
             return "Error executing command: [EMERGENCY FAIL-SAFE TRIGGERED] تم إيقاف الأمر بحركة طوارئ الفأرة."
@@ -175,6 +226,7 @@ class ai_agent:
         command: str,
         on_status: Optional[Callable[[str], None]] = None,
         steps: Optional[List[str]] = None,
+        run: Optional[RunToken] = None,
     ) -> str:
         command = clean_powershell_command(command)
         if not command:
@@ -183,7 +235,7 @@ class ai_agent:
         checked = command.replace("\\", "/").lower()
         for exe in {sys.executable, "python"}:
             checked = checked.replace(exe.replace("\\", "/").lower(), "")
-        if APP_ROOT.replace("\\", "/").lower() in checked:
+        if any(root.replace("\\", "/").lower() in checked for root in (APP_ROOT, str(SAIA_DATA_DIR))):
             return f"Error executing command: Forbidden application folder access. Target Downloads: {DOWNLOADS}."
 
         timeout = DOWNLOAD_TIMEOUT if any(m in command.lower() for m in DOWNLOAD_MARKERS) else DEFAULT_TIMEOUT
@@ -209,13 +261,33 @@ class ai_agent:
         except OSError as exc:
             return f"Error executing command: {exc}"
 
-        return self._collect_output(process, timeout, on_status, steps)
+        if run is not None:
+            run.attach(process)
+        return self._collect_output(process, timeout, on_status, steps, run)
 
     def run_workflow(
         self,
         user_input: str,
         file_path: Optional[str] = None,
         on_status: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Answers one question. Raises Cancelled when agent.cancel() was called meanwhile."""
+        run = RunToken()
+        self._run = run
+        self.mml.bind_cancel(run.event.is_set)
+        try:
+            return self._run_workflow(user_input, file_path, on_status, run)
+        finally:
+            self.mml.bind_cancel(None)
+            if self._run is run:
+                self._run = None
+
+    def _run_workflow(
+        self,
+        user_input: str,
+        file_path: Optional[str],
+        on_status: Optional[Callable[[str], None]],
+        run: RunToken,
     ) -> str:
         self._emit(on_status, "@preparing")
 
@@ -245,7 +317,8 @@ class ai_agent:
         role_info = self.db.get_role(self.role_id)
         memories = self.db.get_longterm_memories(limit=15)
 
-        self.db.save_message(self.session_id, "user", user_input, file_path)
+        stored_path = " | ".join(map(str, file_path)) if isinstance(file_path, (list, tuple)) else file_path
+        self.db.save_message(self.session_id, "user", user_input, stored_path)
 
         raw = self.mml.generate_command(
             user_request=user_input,
@@ -255,6 +328,7 @@ class ai_agent:
             longterm_memories=memories,
             past_sessions_context=past_sessions_context,
         ).strip()
+        run.check()  # cancelled while the model was answering: save nothing
 
         # Parse memory tags if returned
         if "####SAIA_MEMORY####" in raw:
@@ -299,7 +373,7 @@ class ai_agent:
 
         if command:
             steps: List[str] = []
-            execution_result = self.execute_command(command, on_status, steps)
+            execution_result = self.execute_command(command, on_status, steps, run)
             for _ in range(2):
                 if not (execution_result or "").startswith("Error executing command"):
                     break
@@ -314,15 +388,21 @@ class ai_agent:
                 if not fixed_cleaned:
                     break
                 command, message = fixed_cleaned, fixed_msg
-                execution_result = self.execute_command(command, on_status, steps)
+                execution_result = self.execute_command(command, on_status, steps, run)
 
             execution_result = execution_result or ""
             failed = execution_result.startswith("Error")
             verified = "SAIA_OK" in execution_result and not failed
             execution_result = execution_result.replace("SAIA_OK", "").strip()
 
-            if message.strip() and verified and not execution_result:
-                resp = message.strip()
+            produced = extract_file_paths(execution_result)
+            files_block = "\n".join(produced)
+            leftover = execution_result
+            for p in produced:
+                leftover = leftover.replace(p, "")
+
+            if message.strip() and verified and not leftover.strip():
+                resp = message.strip() + (f"\n\n{files_block}" if files_block else "")
                 self.db.save_message(self.session_id, "assistant", resp)
                 return resp
 
@@ -332,6 +412,10 @@ class ai_agent:
                 final_res = self.mml.generate_command(user_input, command=command, output=f"{status}\n{execution_result}")
             except Exception:
                 final_res = f"Action completed with errors: {execution_result[:300]}" if failed else execution_result or "Task completed."
+
+            for p in produced:
+                if p not in final_res:
+                    final_res = f"{final_res}\n\n{p}"
 
             self.db.save_message(self.session_id, "assistant", final_res)
             return final_res
