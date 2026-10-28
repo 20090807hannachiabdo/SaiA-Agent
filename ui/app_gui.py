@@ -17,6 +17,7 @@ import os
 import queue
 import sys
 import threading
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
@@ -24,8 +25,42 @@ from tkinter import filedialog
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.agent_workflow import ai_agent
+from core.api_saia import ENV_FIELDS, ENV_FILE, Cancelled, read_env_values, save_env_values
 from storage.database import Database
+from ui.chat_widgets import FileCard, FunctionCard, split_answer
 from ui.i18n import LANGUAGES, STRINGS, get_language, set_language, t
+
+try:
+    from ui.rich_text import has_wide_blocks, recolor_tags, render_rich
+    RICH_AVAILABLE = True
+except Exception:
+    RICH_AVAILABLE = False
+
+import time  # noqa: E402
+
+try:
+    from core.attachments import DIALOG_PATTERN, MAX_FILES
+except Exception:
+    DIALOG_PATTERN = "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.txt *.py *.html *.md *.pdf"
+    MAX_FILES = 100
+
+try:
+    from core.voice import MAX_RECORD_SECONDS, Recorder, Speaker, transcribe_wav
+    VOICE_AVAILABLE = True
+except Exception:
+    VOICE_AVAILABLE = False
+
+try:
+    from core.api_saia import DEFAULT_VOICE, VOICES, get_media_voice, set_media_voice
+except Exception:
+    DEFAULT_VOICE = "Kore"
+    VOICES = {"Kore": "female"}
+
+    def get_media_voice() -> str:
+        return DEFAULT_VOICE
+
+    def set_media_voice(name: str) -> str:
+        return DEFAULT_VOICE
 
 try:
     from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
@@ -392,27 +427,40 @@ class FloatingOrb:
 #  Asynchronous Worker Thread
 # =========================================================
 class QueryWorker(threading.Thread):
+    """Runs every question in its own thread, so a cancelled request that is still waiting for the
+    network never blocks the next one. Status updates and results of cancelled jobs are dropped."""
+
     def __init__(self, agent: ai_agent):
         super().__init__(daemon=True)
         self._queue = queue.Queue()
         self.results = queue.Queue()
         self.agent = agent
+        self._generation = 0
+
+    def cancel(self):
+        self._generation += 1  # everything submitted before this moment is abandoned
 
     def run(self):
         while True:
-            query, entry_widget, file_path = self._queue.get()
+            job = self._queue.get()
+            threading.Thread(target=self._run_job, args=job, daemon=True).start()
 
-            def report(text: str, _entry=entry_widget):
-                self.results.put(("status", text, _entry))
+    def _run_job(self, query: str, entry_widget: tk.Widget, file_path: Any, generation: int):
+        def report(text: str):
+            if generation == self._generation:
+                self.results.put(("status", text, entry_widget))
 
-            try:
-                result = self.agent.run_workflow(query, file_path, on_status=report)
-            except Exception as e:
-                result = t("error_exec", error=e)
+        try:
+            result = self.agent.run_workflow(query, file_path, on_status=report)
+        except Cancelled:
+            return
+        except Exception as e:
+            result = t("no_api_key") if "AI_API_KEY" in str(e) else t("error_exec", error=e)
+        if generation == self._generation:
             self.results.put(("result", result, entry_widget))
 
     def submit(self, query: str, entry_widget: tk.Widget, file_path: Optional[str] = None):
-        self._queue.put((query, entry_widget, file_path))
+        self._queue.put((query, entry_widget, file_path, self._generation))
 
 
 # =========================================================
@@ -489,6 +537,7 @@ class UserSettings:
         "user_nickname": "",
         "selected_model": "gemini-3.5-flash-lite",
         "active_role": "student",
+        "tts_voice": DEFAULT_VOICE,
     }
 
     def __init__(self):
@@ -508,6 +557,8 @@ class UserSettings:
             self.data["language"] = self.DEFAULTS["language"]
         if not isinstance(self.data.get("user_nickname"), str):
             self.data["user_nickname"] = ""
+        if self.data.get("tts_voice") not in VOICES:
+            self.data["tts_voice"] = DEFAULT_VOICE
         try:
             ids = [m["id"] for m in self.db.list_models()]
         except Exception:
@@ -801,6 +852,15 @@ class RolePicker(tk.Menubutton):
             self.configure(text=f"{icon} {name} ▾")
         else:
             self.configure(text=f"🎓 {current_id} ▾")
+
+
+def _voice_label(name: str) -> str:
+    """Picker label: 'Kore ♀' / 'Puck ♂'."""
+    return f"{name} {'♂' if VOICES.get(name) == 'male' else '♀'}"
+
+
+def _voice_from_label(label: str) -> str:
+    return label.split()[0] if label else DEFAULT_VOICE
 
 
 def _language_label(code: str) -> str:
@@ -1202,6 +1262,133 @@ class AutomationFlowWindow:
 # =========================================================
 # Settings Window
 # =========================================================
+class CredentialsWindow:
+    """View / edit the API key, Gmail address and Gmail app password stored in api_keys.env."""
+
+    FIELDS = (
+        ("AI_API_KEY", "cred_api_key", True),
+        ("SENDER_EMAIL", "cred_gmail", False),
+        ("APP_PASSWRD", "cred_app_password", True),
+    )
+
+    def __init__(self, parent: tk.Widget, app: Any):
+        self.app = app
+        live = app.live
+        values = read_env_values()
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(t("cred_title"))
+        self.window.geometry("520x470")
+        self.window.configure(bg=Theme.BG_DARK)
+        self.window.resizable(False, False)
+        self.window.transient(parent)
+        apply_native_titlebar_color(self.window, "#ffffff", text_color="#000000")
+
+        header = tk.Frame(self.window, bg=Theme.BG_DARK)
+        header.pack(fill="x", padx=24, pady=(18, 6))
+        title_lbl = tk.Label(header, text="", font=("Segoe UI", 10, "bold"), bg=Theme.BG_DARK, fg=Theme.TEXT_MUTED)
+        live.bind(title_lbl, lambda: t("credentials"))
+        title_lbl.pack(side="left")
+
+        divider(self.window).pack(fill="x", padx=24, pady=(10, 14))
+
+        body = tk.Frame(self.window, bg=Theme.BG_DARK)
+        body.pack(fill="both", expand=True, padx=24)
+
+        if not any(values.values()):
+            hint = tk.Label(
+                body, text="", font=Theme.FONT_LABEL, bg=Theme.BG_DARK, fg=Theme.ACCENT_HOVER,
+                wraplength=460, justify="left",
+            )
+            live.bind(hint, lambda: t("cred_empty_hint"))
+            hint.pack(anchor="w", pady=(0, 12))
+
+        self.vars: Dict[str, tk.StringVar] = {}
+        self.entries: Dict[str, tk.Entry] = {}
+        for key, label_key, secret in self.FIELDS:
+            lbl = tk.Label(body, text="", font=Theme.FONT_LABEL, bg=Theme.BG_DARK, fg=Theme.TEXT_SECONDARY)
+            live.bind(lbl, lambda k=label_key: t(k))
+            lbl.pack(anchor="w", pady=(0, 6))
+
+            row = tk.Frame(body, bg=Theme.BG_DARK)
+            row.pack(fill="x", pady=(0, 14))
+
+            wrap = tk.Frame(
+                row, bg=Theme.BG_FIELD, highlightthickness=1,
+                highlightbackground=Theme.BORDER, highlightcolor=Theme.BORDER_LIGHT,
+            )
+            wrap.pack(side="left", fill="x", expand=True)
+
+            var = tk.StringVar(value=values.get(key, ""))
+            entry = tk.Entry(
+                wrap, textvariable=var, bg=Theme.BG_FIELD, fg=Theme.TEXT_PRIMARY,
+                insertbackground=Theme.TEXT_PRIMARY, relief="flat", bd=0, font=Theme.FONT_UI,
+                show="\u2022" if secret else "",
+            )
+            entry.pack(fill="x", ipady=7, padx=10)
+            entry.bind("<Return>", lambda e: self.save())
+            self.vars[key] = var
+            self.entries[key] = entry
+
+            if secret:
+                eye = ghost_button(row, "\U0001F441", lambda en=entry: self._toggle(en), padx=8, pady=2)
+                eye.pack(side="left", padx=(8, 0))
+
+        file_lbl = tk.Label(
+            body, text="", font=("Segoe UI", 8), bg=Theme.BG_DARK, fg=Theme.TEXT_MUTED,
+            wraplength=460, justify="left",
+        )
+        live.bind(file_lbl, lambda: t("cred_file", path=str(ENV_FILE)))
+        file_lbl.pack(anchor="w", pady=(0, 2))
+
+        note_lbl = tk.Label(body, text="", font=("Segoe UI", 8), bg=Theme.BG_DARK, fg=Theme.TEXT_MUTED)
+        live.bind(note_lbl, lambda: t("cred_note"))
+        note_lbl.pack(anchor="w", pady=(0, 12))
+
+        actions = tk.Frame(body, bg=Theme.BG_DARK)
+        actions.pack(fill="x")
+        self.save_btn = solid_button(actions, "", self.save)
+        live.bind(self.save_btn, lambda: t("save"))
+        self.save_btn.pack(side="left")
+
+        self.status = tk.Label(
+            actions, text="", font=Theme.FONT_LABEL, bg=Theme.BG_DARK, fg=Theme.ACCENT_HOVER,
+            wraplength=320, justify="left",
+        )
+        self.status.pack(side="left", padx=(12, 0))
+
+    @staticmethod
+    def _toggle(entry: tk.Entry):
+        entry.configure(show="" if entry.cget("show") else "\u2022")
+
+    def _set_status(self, text: str, error: bool = False):
+        try:
+            self.status.configure(text=text, fg="#ff6b6b" if error else Theme.ACCENT_HOVER)
+            self.window.after(3000, lambda: self._clear_status(text))
+        except tk.TclError:
+            pass
+
+    def _clear_status(self, text: str):
+        try:
+            if self.status.cget("text") == text:
+                self.status.configure(text="")
+        except tk.TclError:
+            pass
+
+    def save(self):
+        values = {key: self.vars[key].get().strip() for key in ENV_FIELDS}
+        email = values["SENDER_EMAIL"]
+        if email and ("@" not in email or " " in email):
+            self._set_status(t("cred_invalid_email"), error=True)
+            return
+        try:
+            save_env_values(values)
+        except Exception as exc:
+            self._set_status(t("cred_save_failed", error=str(exc)[:140]), error=True)
+            return
+        self._set_status(t("saved"))
+
+
 class SettingsWindow:
     def __init__(self, parent: tk.Widget, app: Any):
         self.app = app
@@ -1209,7 +1396,7 @@ class SettingsWindow:
 
         self.window = tk.Toplevel(parent)
         self.window.title(t("settings_title"))
-        self.window.geometry("600x480")
+        self.window.geometry("600x580")
         self.window.configure(bg=Theme.BG_DARK)
         self.window.resizable(False, False)
 
@@ -1275,6 +1462,37 @@ class SettingsWindow:
         self.model_picker = ModelPicker(left_col, app, width=20)
         self.model_picker.pack(anchor="w")
 
+        if VOICE_AVAILABLE:
+            voice_section = tk.Label(left_col, text="", font=("Segoe UI", 8, "bold"), bg=Theme.BG_DARK, fg=Theme.TEXT_MUTED)
+            live.bind(voice_section, lambda: t("voice_section"))
+            voice_section.pack(anchor="w", pady=(24, 8))
+
+            voice_row = tk.Frame(left_col, bg=Theme.BG_DARK)
+            voice_row.pack(anchor="w")
+
+            self.voice_var = tk.StringVar(value=_voice_label(app.settings.get("tts_voice")))
+            voice_field = tk.Frame(
+                voice_row, bg=Theme.BG_FIELD, highlightthickness=1, highlightbackground=Theme.BORDER, highlightcolor=Theme.BORDER
+            )
+            voice_field.pack(side="left")
+
+            self.voice_dropdown = tk.OptionMenu(
+                voice_field, self.voice_var, *[_voice_label(n) for n in VOICES], command=self._on_voice
+            )
+            self.voice_dropdown.config(
+                bg=Theme.BG_FIELD, fg=Theme.TEXT_PRIMARY, relief="flat", bd=0, activebackground=Theme.BORDER_LIGHT,
+                activeforeground=Theme.TEXT_PRIMARY, highlightthickness=0, font=Theme.FONT_UI, width=11, anchor="w",
+            )
+            self.voice_dropdown["menu"].config(
+                bg=Theme.BG_FIELD, fg=Theme.TEXT_PRIMARY, activebackground=Theme.BORDER_LIGHT,
+                activeforeground=Theme.TEXT_PRIMARY, relief="flat", bd=0,
+            )
+            self.voice_dropdown.pack(ipady=5, padx=4)
+
+            self.voice_preview_btn = outline_button(voice_row, "", self.app.preview_voice)
+            live.bind(self.voice_preview_btn, lambda: t("voice_preview"))
+            self.voice_preview_btn.pack(side="left", padx=(8, 0))
+
         vdiv = divider(body, orient="v")
         vdiv.pack(side="left", fill="y", pady=4)
 
@@ -1328,8 +1546,31 @@ class SettingsWindow:
         live.bind(self.sign_up_btn, lambda: t("sign_up"))
         self.sign_up_btn.pack(side="left", padx=(10, 0))
 
+        conn_label = tk.Label(right_col, text="", font=("Segoe UI", 8, "bold"), bg=Theme.BG_DARK, fg=Theme.TEXT_MUTED)
+        live.bind(conn_label, lambda: t("connections_section"))
+        conn_label.pack(anchor="w", pady=(24, 12))
+
+        self.keys_btn = outline_button(right_col, "", self.open_credentials)
+        live.bind(self.keys_btn, lambda: t("credentials"))
+        self.keys_btn.pack(anchor="w")
+
     def _on_language(self, label: str):
         self.app.change_language(LANGUAGES.get(label, "en"))
+
+    def _on_voice(self, label: str):
+        self.app.change_voice(_voice_from_label(label))
+
+    def open_credentials(self):
+        win = getattr(self, "_cred_win", None)
+        try:
+            alive = win is not None and bool(win.window.winfo_exists())
+        except tk.TclError:
+            alive = False
+        if alive:
+            win.window.lift()
+            win.window.focus_force()
+            return
+        self._cred_win = CredentialsWindow(self.window, self.app)
 
     def save_name(self):
         self.app.set_nickname(self.user_entry.get())
@@ -1368,7 +1609,16 @@ class SaiAApp:
         self.model_pickers: List[ModelPicker] = []
         self.role_pickers: List[RolePicker] = []
         self.attached_file: Optional[str] = None
+        self.attached_files: List[str] = []
+        self.recorder = Recorder() if VOICE_AVAILABLE else None
+        self.speaker = Speaker() if VOICE_AVAILABLE else None
+        set_media_voice(self.settings.get("tts_voice"))
+        self._mic_btns: List[tk.Widget] = []
+        self._mic_target: Optional[tk.Text] = None
+        self._stt_busy = False
         self._bubbles: List[Tuple[tk.Canvas, int, int, int]] = []
+        self._rich_texts: List[tk.Text] = []
+        self._cards: List[Any] = []
 
         self.active_role = self.settings.get("active_role") or "student"
 
@@ -1517,9 +1767,15 @@ class SaiAApp:
 
         input_frame = tk.Frame(self.frame_ex1, bg=Theme.BG_DARK)
         input_frame.pack(fill="x", padx=20, pady=16)
+        self.input_frame1 = input_frame
+        self.tray = tk.Frame(self.frame_ex1, bg=Theme.BG_PANEL, highlightthickness=1, highlightbackground=Theme.BORDER)
 
         attach_btn = ghost_button(input_frame, "📎", self.attach_file, padx=8, pady=4, font=("Segoe UI", 12))
         attach_btn.pack(side="left", padx=(0, 8))
+        if VOICE_AVAILABLE:
+            mic1 = ghost_button(input_frame, "🎤", lambda: self.toggle_mic(self.entry_ex1), padx=8, pady=4, font=("Segoe UI", 12))
+            mic1.pack(side="left", padx=(0, 8))
+            self._mic_btns.append(mic1)
 
         entry_wrap = tk.Frame(
             input_frame, bg=Theme.BG_FIELD, highlightthickness=1,
@@ -1550,15 +1806,16 @@ class SaiAApp:
             self.entry_ex1.bind(_seq, _grow1)
         self.entry_ex1.bind("<Return>", lambda event: (self.send_prompt(self.entry_ex1), "break")[1])
         self.entry_ex1.bind("<Shift-Return>", lambda event: None)
+        self.entry_ex1.bind("<Escape>", lambda event: (self.cancel_current(), "break")[1] if self._pending else None)
 
-        send_btn = tk.Button(
+        self.send_btn1 = send_btn = tk.Button(
             input_frame, text="", font=Theme.FONT_UI_BOLD, bg=Theme.ACCENT, fg=Theme.BG_DARK,
             activebackground=Theme.ACCENT_HOVER, activeforeground=Theme.BG_DARK, relief="flat",
-            bd=0, cursor="hand2", padx=18, command=lambda: self.send_prompt(self.entry_ex1),
+            bd=0, cursor="hand2", padx=18, command=lambda: self._send_or_cancel(self.entry_ex1),
         )
         add_hover(send_btn, Theme.ACCENT, Theme.ACCENT_HOVER, Theme.BG_DARK, Theme.BG_DARK)
         send_btn.pack(side="right", padx=(10, 0), ipady=8)
-        self.live.bind(send_btn, lambda: t("send"))
+        self.live.bind(send_btn, lambda: self._send_label())
 
     def setup_ex2_floating_icon(self):
         self.orb = FloatingOrb(self.root, self.EX2_SIZE, on_click=self.show_ex1)
@@ -1571,7 +1828,7 @@ class SaiAApp:
         )
         bar_container.pack(fill="both", expand=True, pady=10, padx=10)
 
-        left_icon = tk.Label(bar_container, text=" ❯ ", font=("Segoe UI", 11, "bold"), bg=Theme.BG_FIELD, fg=Theme.TEXT_SECONDARY)
+        left_icon = self.left_icon3 = tk.Label(bar_container, text=" ❯ ", font=("Segoe UI", 11, "bold"), bg=Theme.BG_FIELD, fg=Theme.TEXT_SECONDARY)
         left_icon.pack(side="left", padx=(6, 2))
 
         icon_div = divider(bar_container, orient="v")
@@ -1603,33 +1860,294 @@ class SaiAApp:
             self.entry_ex3.bind(_seq, _grow3)
         self.entry_ex3.bind("<Return>", lambda event: (self.send_prompt(self.entry_ex3), "break")[1])
         self.entry_ex3.bind("<Shift-Return>", lambda event: None)
+        self.entry_ex3.bind("<Escape>", lambda event: (self.cancel_current(), "break")[1] if self._pending else None)
 
         btn_expand_box = ghost_button(
             bar_container, "⤢", self.show_ex1, bg=Theme.BG_FIELD, hover_bg=Theme.BORDER, padx=10, pady=4,
         )
         btn_expand_box.pack(side="right", padx=6)
+        self.cancel3 = ghost_button(
+            bar_container, "■", self.cancel_current, bg=Theme.BG_FIELD, hover_bg=Theme.BORDER,
+            padx=8, pady=4, font=("Segoe UI", 11),
+        )  # shown only while an answer is being prepared
+        if VOICE_AVAILABLE:
+            mic3 = ghost_button(
+                bar_container, "🎤", lambda: self.toggle_mic(self.entry_ex3), bg=Theme.BG_FIELD,
+                hover_bg=Theme.BORDER, padx=8, pady=4, font=("Segoe UI", 11),
+            )
+            mic3.pack(side="right")
+            self._mic_btns.append(mic3)
 
+    # ---------------- attachments (any number of files) ----------------
     def attach_file(self):
-        path = filedialog.askopenfilename(
+        paths = filedialog.askopenfilenames(
             parent=self.root,
-            filetypes=[("Supported files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.txt *.py *.html *.md *.pdf")],
+            filetypes=[("Supported files", DIALOG_PATTERN), ("All files", "*.*")],
         )
-        if path:
-            self.attached_file = path
+        added = []
+        for p in paths or ():
+            if p not in self.attached_files and len(self.attached_files) < MAX_FILES:
+                self.attached_files.append(p)
+                added.append(p)
+        if added:
+            shown = ", ".join(os.path.basename(p) for p in added[:3]) + (f" (+{len(added) - 3})" if len(added) > 3 else "")
             self.output_box.configure(state="normal")
-            self.output_box.insert(tk.END, f"📎 {os.path.basename(path)}\n", "user_tag")
+            self.output_box.insert(tk.END, f"📎 {shown}\n", "user_tag")
             self.output_box.configure(state="disabled")
             self.output_box.see(tk.END)
+        self._refresh_tray()
+
+    def _refresh_tray(self):
+        tray = self.tray
+        for w in tray.winfo_children():
+            w.destroy()
+        files = self.attached_files
+        if not files:
+            tray.pack_forget()
+            return
+        names = ", ".join(os.path.basename(p) for p in files[:2]) + (f" +{len(files) - 2}" if len(files) > 2 else "")
+        text = f"📎 {t('attach_n_files', n=len(files))}: {names}"
+        tk.Label(
+            tray, text=text if len(text) <= 58 else text[:55] + "...", font=Theme.FONT_LABEL,
+            bg=Theme.BG_PANEL, fg=Theme.TEXT_SECONDARY, anchor="w",
+        ).pack(side="left", padx=(10, 4), pady=5)
+        ghost_button(tray, "✕", self.clear_attachments, bg=Theme.BG_PANEL, hover_bg=Theme.BORDER, padx=6, pady=2).pack(side="right", padx=(0, 4))
+        ghost_button(tray, t("manage"), self.manage_attachments, bg=Theme.BG_PANEL, hover_bg=Theme.BORDER, padx=8, pady=2, font=Theme.FONT_LABEL).pack(side="right")
+        if not tray.winfo_ismapped():
+            tray.pack(fill="x", padx=20, before=self.input_frame1)
+
+    def clear_attachments(self):
+        self.attached_files = []
+        self._refresh_tray()
+
+    def manage_attachments(self):
+        win = tk.Toplevel(self.root)
+        win.title(t("attachments"))
+        win.geometry("460x380")
+        win.configure(bg=Theme.BG_DARK)
+        apply_native_titlebar_color(win, "#ffffff", text_color="#000000")
+
+        container = tk.Frame(win, bg=Theme.BG_PANEL, highlightthickness=1, highlightbackground=Theme.BORDER)
+        container.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        scroll = MinimalScrollbar(container, width=8)
+        scroll.pack(side="right", fill="y", padx=(0, 4), pady=4)
+        listbox = tk.Listbox(
+            container, selectmode="extended", bg=Theme.BG_PANEL, fg=Theme.TEXT_PRIMARY,
+            selectbackground=Theme.ACCENT_DIM, selectforeground=Theme.TEXT_PRIMARY, activestyle="none",
+            relief="flat", bd=0, highlightthickness=0, font=Theme.FONT_UI, yscrollcommand=scroll.set,
+        )
+        listbox.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        scroll.command = listbox.yview
+
+        def fill():
+            listbox.delete(0, "end")
+            for p in self.attached_files:
+                listbox.insert("end", "  " + os.path.basename(p))
+
+        def remove():
+            for idx in reversed(listbox.curselection()):
+                del self.attached_files[idx]
+            fill()
+            self._refresh_tray()
+            if not self.attached_files:
+                win.destroy()
+
+        def add_more():
+            self.attach_file()
+            fill()
+
+        row = tk.Frame(win, bg=Theme.BG_DARK)
+        row.pack(fill="x", padx=16, pady=(0, 16))
+        outline_button(row, t("remove_selected"), remove).pack(side="left")
+        solid_button(row, t("add_more"), add_more).pack(side="right")
+        fill()
+
+    def _send_label(self) -> str:
+        return f"■ {t('cancel')}" if self._pending else t("send")
+
+    def _send_or_cancel(self, entry_widget: tk.Text):
+        if self._pending:
+            self.cancel_current()
+        else:
+            self.send_prompt(entry_widget)
+
+    def _update_busy_ui(self):
+        """Send button <-> Cancel button (and the compact bar's indicator) follow the busy state."""
+        busy = bool(self._pending)
+        try:
+            self.send_btn1.configure(text=self._send_label())
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            if busy and not self.cancel3.winfo_ismapped():
+                self.cancel3.pack(side="right", padx=(0, 2))
+            elif not busy:
+                self.cancel3.pack_forget()
+                self.left_icon3.configure(text=" ❯ ")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def cancel_current(self):
+        """Stops the question being processed: the model request is abandoned, a running command is
+        killed, and the chat is free again. Whatever you typed meanwhile stays in the input box."""
+        if not self._pending:
+            return
+        try:
+            self.agent.cancel()
+        except Exception:
+            pass
+        self.worker.cancel()
+        for entry in list(self._pending):
+            self._stop_thinking(entry)
+        self._note(t("cancelled"))
 
     def send_prompt(self, entry_widget: tk.Text):
-        query = entry_widget.get("1.0", "end-1c").strip()
-        if not query:
+        if self._pending:  # one question at a time; the button is "Cancel" meanwhile
             return
+        query = entry_widget.get("1.0", "end-1c").strip()
+        files = list(self.attached_files)
+        if not query and not files:
+            return
+        if not query:
+            query = t("analyze_attachments")
 
         self._show_result(query, entry_widget, role="user")
+        entry_widget.delete("1.0", "end")
+        entry_widget.event_generate("<<Resize>>")
         self._start_thinking(entry_widget)
-        file_path, self.attached_file = self.attached_file, None
-        self.worker.submit(query, entry_widget, file_path)
+        self.attached_files = []
+        self._refresh_tray()
+        self.worker.submit(query, entry_widget, files or None)
+
+    # ---------------- notes ----------------
+    def _note(self, text: str):
+        self.output_box.configure(state="normal")
+        self.output_box.insert(tk.END, f"{text}\n", "user_tag")
+        self.output_box.configure(state="disabled")
+        self.output_box.see(tk.END)
+
+    # ---------------- speech to text (microphone) ----------------
+    def toggle_mic(self, entry_widget: tk.Text):
+        if not VOICE_AVAILABLE or self._stt_busy:
+            return
+        if self.recorder.recording:
+            self._finish_recording()
+            return
+        ok, err = self.recorder.start()
+        if not ok:
+            self._note(t("mic_error", error=err))
+            return
+        self._mic_target = entry_widget
+        self._set_mic_ui("rec", "0:00")
+        self._tick_mic()
+
+    def _tick_mic(self):
+        if not self.recorder.recording:
+            return
+        secs = self.recorder.elapsed
+        if secs >= MAX_RECORD_SECONDS:
+            self._finish_recording()
+            return
+        self._set_mic_ui("rec", f"{secs // 60}:{secs % 60:02d}")
+        self.root.after(500, self._tick_mic)
+
+    def _set_mic_ui(self, state: str, extra: str = ""):
+        for btn in list(self._mic_btns):
+            try:
+                if state == "rec":
+                    btn.configure(text=f"⏹ {extra}", fg="#ff6b6b")
+                elif state == "busy":
+                    btn.configure(text="…", fg=Theme.TEXT_MUTED)
+                else:
+                    btn.configure(text="🎤", fg=Theme.TEXT_SECONDARY)
+            except tk.TclError:
+                pass
+
+    def _finish_recording(self):
+        path, err = self.recorder.stop()
+        target = self._mic_target
+        if not path:
+            self._set_mic_ui("idle")
+            self._note(t("mic_too_short") if err == "too_short" else t("mic_error", error=err))
+            return
+        self._stt_busy = True
+        self._set_mic_ui("busy")
+        mml_obj = self.agent.mml
+
+        def work():
+            text, error = "", None
+            try:
+                text = transcribe_wav(mml_obj, path)
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            self.worker.results.put(("stt", (text, error), target))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_transcript(self, payload, entry_widget: tk.Text):
+        text, error = payload
+        self._stt_busy = False
+        self._set_mic_ui("idle")
+        if error:
+            self._note(t("mic_error", error=error[:160]))
+            return
+        if not text:
+            self._note(t("mic_no_speech"))
+            return
+        try:
+            entry_widget.configure(state="normal")
+            if entry_widget.get("1.0", "end-1c").strip():
+                entry_widget.insert("end", " ")
+            entry_widget.insert("end", text)
+            entry_widget.event_generate("<KeyRelease>")
+            entry_widget.see("end")
+            entry_widget.focus_set()
+        except tk.TclError:
+            pass
+
+    # ---------------- text to speech (read the answer aloud) ----------------
+    def toggle_speak(self, text: str, btn: tk.Button):
+        sp = self.speaker
+        if sp.active and sp.token is btn:
+            sp.stop()  # on_done resets the button
+            return
+        old = sp.token
+        if old is not None and old is not btn:
+            try:
+                old.configure(text="🔊")
+            except tk.TclError:
+                pass
+        btn.configure(text="⏹")
+        sp.speak(
+            text, self.agent.mml, token=btn,
+            on_done=lambda tok, err: self.worker.results.put(("tts", err, tok)),
+        )
+
+    def preview_voice(self):
+        """Plays a short sample with the currently selected voice (used by the Settings window)."""
+        if not self.speaker:
+            return
+        self.speaker.speak(
+            t("voice_preview_text"), self.agent.mml, token=None,
+            on_done=lambda tok, err: self.worker.results.put(("tts", err, tok)),
+        )
+
+    def _on_speak_done(self, error, btn: tk.Button):
+        if error:
+            self._note(t("tts_error", error=str(error)[:160]))
+        if btn is None:  # voice preview in Settings has no button to reset
+            return
+        if self.speaker.active and self.speaker.token is btn:
+            return  # a newer playback on this button already started
+        try:
+            btn.configure(text="🔊")
+        except tk.TclError:
+            pass
 
     def _poll_results(self):
         try:
@@ -1637,6 +2155,10 @@ class SaiAApp:
                 kind, payload, entry_widget = self.worker.results.get_nowait()
                 if kind == "status":
                     self._on_status(payload)
+                elif kind == "stt":
+                    self._on_transcript(payload, entry_widget)
+                elif kind == "tts":
+                    self._on_speak_done(payload, entry_widget)
                 else:
                     self._show_result(payload, entry_widget, role="bot")
         except queue.Empty:
@@ -1647,6 +2169,7 @@ class SaiAApp:
 
     def _start_thinking(self, entry_widget: tk.Text):
         self._pending.add(entry_widget)
+        self._update_busy_ui()
         self._steps = []
         self._current_status = None
         if self._think_job is None:
@@ -1669,12 +2192,6 @@ class SaiAApp:
         self._steps = []
         self._current_status = None
         try:
-            entry_widget.configure(state="normal")
-            entry_widget.delete("1.0", tk.END)
-            entry_widget.event_generate("<<Resize>>")
-        except Exception:
-            pass
-        try:
             ranges = self.output_box.tag_ranges("thinking")
             if ranges:
                 self.output_box.configure(state="normal")
@@ -1682,20 +2199,16 @@ class SaiAApp:
                 self.output_box.configure(state="disabled")
         except Exception:
             pass
+        self._update_busy_ui()
 
     def _render_thinking(self):
         frame = self.THINK_FRAMES[self._think_tick % len(self.THINK_FRAMES)]
         current = self._current_status or t("thinking")
 
-        for e in self._pending:
-            try:
-                e.configure(state="normal")
-                e.delete("1.0", tk.END)
-                e.insert("1.0", f"{current} {frame}")
-                e.configure(state="disabled")
-                e.event_generate("<<Resize>>")
-            except Exception:
-                pass
+        try:  # compact bar: the left icon animates; the input box itself stays free for typing
+            self.left_icon3.configure(text=f" {frame} ")
+        except (tk.TclError, AttributeError):
+            pass
 
         rows = [f"✓ {step}" for step in self._steps[-6:]] + [f"{current} {frame}"]
         block = "SaiA ◆ " + ("\n" + " " * 8).join(rows) + "\n"
@@ -1722,12 +2235,92 @@ class SaiAApp:
         self._think_job = self.root.after(350, self._animate_thinking)
 
     def _show_result(self, result: Any, entry_widget: tk.Text, role: str = "bot"):
+        """Shows a message. Bot answers may contain interactive cards (function analysis, files)."""
         if result is None:
             result = t("done")
+        if role == "user":
+            self._show_bubble(result, entry_widget, role)
+            return
 
-        if role != "user":
-            self._stop_thinking(entry_widget)
+        self._stop_thinking(entry_widget)
+        text_value = str(result).strip()
+        try:
+            segments = split_answer(text_value)
+        except Exception:
+            traceback.print_exc()  # do not hide why the cards disappeared
+            segments = [("text", text_value)]
 
+        if all(kind == "text" for kind, _ in segments):
+            self._show_bubble(text_value, entry_widget, role)
+        else:
+            speech = "\n".join(v for k, v in segments if k == "text")
+            header_done = False
+            for kind, value in segments:
+                if kind == "text":
+                    self._show_bubble(value, entry_widget, role, header=not header_done, speech_text=speech)
+                else:
+                    if not header_done:
+                        self.output_box.configure(state="normal")
+                        self._insert_header(False, "left_align", speech)
+                        self.output_box.configure(state="disabled")
+                    self._insert_card(kind, value)
+                header_done = True
+        entry_widget.focus_set()
+
+    def _insert_card(self, kind: str, value: Any):
+        box = self.output_box
+        avail = box.winfo_width() - 48
+        # function window uses the full chat width (bigger graph); file cards stay compact
+        width = max(300, min(900, avail)) if kind == "func" else max(280, min(560, avail - 8))
+
+        def wheel(e):
+            box.yview_scroll(int(-e.delta / 120), "units")
+            return "break"
+
+        try:
+            if kind == "func":
+                card = FunctionCard(box, Theme, value, t, width=width, on_wheel=wheel)
+            else:
+                card = FileCard(box, Theme, value, t, width=width, on_wheel=wheel, notify=self._note)
+        except Exception:
+            traceback.print_exc()
+            if kind == "file":  # never lose the path if the card cannot be built
+                box.configure(state="normal")
+                box.insert(tk.END, f"{value}\n", "left_align")
+                box.configure(state="disabled")
+            return
+        self._cards.append(card)
+        box.configure(state="normal")
+        start = box.index("end-1c")
+        box.window_create(tk.END, window=card)
+        box.insert(tk.END, "\n")
+        box.tag_add("left_align", start, "end-1c")
+        box.tag_add("gap", start, "end-1c")
+        box.configure(state="disabled")
+        box.see(tk.END)
+        self.root.after(80, lambda: box.see(tk.END))
+        self.root.after(300, lambda: box.see(tk.END))
+
+    def _insert_header(self, is_user: bool, align: str, speech_text: str):
+        """Writes the 'SaiA ◆ 🔊' / user-name line. The output box must be in normal state."""
+        box = self.output_box
+        who = (self.settings.get("user_nickname") or t("you")) if is_user else "SaiA ◆"
+        name_tags = (align, "name_user" if is_user else "name_bot")
+        if is_user or not VOICE_AVAILABLE:
+            box.insert(tk.END, f"{who}\n", name_tags)
+        else:
+            box.insert(tk.END, f"{who}  ", name_tags)
+            speak_btn = tk.Button(
+                box, text="🔊", font=("Segoe UI", 9), bg=Theme.BG_PANEL, fg=Theme.TEXT_MUTED,
+                activebackground=Theme.BG_PANEL, activeforeground=Theme.TEXT_PRIMARY,
+                relief="flat", bd=0, cursor="hand2", padx=4, pady=0,
+            )
+            speak_btn.configure(command=lambda b=speak_btn, s=speech_text: self.toggle_speak(s, b))
+            box.window_create(tk.END, window=speak_btn)
+            box.insert(tk.END, "\n", name_tags)
+
+    def _show_bubble(self, result: Any, entry_widget: tk.Text, role: str = "bot",
+                     header: bool = True, speech_text: Optional[str] = None):
         is_user = (role == "user")
         box = self.output_box
         text_value = str(result).strip()
@@ -1737,7 +2330,10 @@ class SaiAApp:
         fill_token = Theme.ACCENT_DIM if is_user else Theme.BG_FIELD
         line_token = Theme.ACCENT if is_user else Theme.BORDER
 
+        use_rich = RICH_AVAILABLE and not is_user
         natural = max(ui_font.measure(line) for line in text_value.split("\n")) + 2 * pad + 6
+        if use_rich and has_wide_blocks(text_value):
+            natural = 10 ** 4  # tables / code blocks use the full available width
         bubble_w = max(140, min(max(box.winfo_width(), 300) - 44, natural))
 
         cv = tk.Canvas(box, bg=Theme.BG_PANEL, highlightthickness=0, bd=0, width=bubble_w, height=line_h + 2 * pad)
@@ -1746,9 +2342,38 @@ class SaiAApp:
             font=Theme.FONT_UI, relief="flat", bd=0, padx=0, pady=0, highlightthickness=0,
             insertwidth=0, cursor="arrow",
         )
-        txt.insert("1.0", text_value)
-        txt.configure(state="disabled")
+        def wheel(e):
+            box.yview_scroll(int(-e.delta / 120), "units")
+            return "break"
+
+        rich = None
+        if use_rich:
+            try:
+                rich = render_rich(
+                    txt, text_value, Theme,
+                    labels={"copy": t("copy_code"), "copied": t("copied_code")},
+                    on_layout=lambda: relayout(), on_wheel=wheel,
+                )
+            except Exception:
+                rich = None  # any parsing/layout problem -> fall back to plain text
+        if rich is None:
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", text_value)
+            txt.configure(state="disabled")
         win = cv.create_window(pad, pad, anchor="nw", window=txt, width=bubble_w - 2 * pad, height=line_h)
+
+        def relayout():
+            def apply():
+                try:
+                    px = int((txt.count("1.0", "end", "ypixels") or (line_h,))[0])
+                    px = max(line_h, px)
+                    if abs(px - float(cv.itemcget(win, "height"))) > 0.5:
+                        cv.itemconfigure(win, height=px)
+                        cv.configure(height=px + 2 * pad)
+                except tk.TclError:
+                    pass
+            txt.after_idle(apply)
 
         cv.bind(
             "<Configure>",
@@ -1782,14 +2407,19 @@ class SaiAApp:
             )((txt.count("1.0", "end", "displaylines") or (1,))[0]),
         )
 
+        if rich is not None:
+            rich.attach()  # pixel-based sizing (tables / code blocks) replaces the line-based handler
+            self._rich_texts.append(txt)
+            txt.after(40, relayout)
+
         for part in (cv, txt):
             part.bind("<MouseWheel>", lambda e: (box.yview_scroll(int(-e.delta / 120), "units"), "break")[1])
         txt.bind("<Button-1>", lambda e: txt.focus_set())
 
         align = "right_align" if is_user else "left_align"
-        who = (self.settings.get("user_nickname") or t("you")) if is_user else "SaiA ◆"
         box.configure(state="normal")
-        box.insert(tk.END, f"{who}\n", (align, "name_user" if is_user else "name_bot"))
+        if header:
+            self._insert_header(is_user, align, speech_text or text_value)
         start = box.index("end-1c")
         box.window_create(tk.END, window=cv)
         box.insert(tk.END, "\n")
@@ -1802,14 +2432,15 @@ class SaiAApp:
         self.root.after(80, lambda: box.see(tk.END))
         self.root.after(300, lambda: box.see(tk.END))
 
-        if role != "user":
-            entry_widget.focus_set()
-
     def switch_session(self, session_id: str):
         """Switches the active conversation session and redraws historic bubbles from disk."""
         self.current_session_id = session_id
         self.agent.set_session(session_id, self.active_role)
         self._bubbles.clear()
+        self._rich_texts.clear()
+        self._cards.clear()
+        if VOICE_AVAILABLE:
+            self.speaker.stop()
 
         self.output_box.configure(state="normal")
         self.output_box.delete("1.0", tk.END)
@@ -1884,7 +2515,18 @@ class SaiAApp:
         mapping = Theme.mapping(old, new)
         Theme.apply(new)
         recolor_tree(self.root, mapping)
+        if RICH_AVAILABLE:
+            for rt in self._rich_texts:
+                try:
+                    recolor_tags(rt, mapping)
+                except tk.TclError:
+                    pass
         self._apply_tag_colors()
+        for card in self._cards:
+            try:
+                card.restyle()
+            except Exception:
+                pass
         self.live.refresh()
         self.settings.set(theme=new)
 
@@ -1897,6 +2539,9 @@ class SaiAApp:
         self.refresh_role_pickers()
         if self._settings_alive():
             self._settings_win.window.title(t("settings_title"))
+
+    def change_voice(self, name: str):
+        self.settings.set(tts_voice=set_media_voice(name))
 
     def set_nickname(self, name: str):
         self.settings.set(user_nickname=name.strip())
